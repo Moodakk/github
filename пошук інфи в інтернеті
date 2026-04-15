@@ -1,0 +1,3296 @@
+@echo off
+cd /d "%~dp0"
+python main.py
+
+import sys"""
+Flask web server for the Book Catalog.
+Run:  python web/server.py
+Then open http://localhost:5000
+"""
+import sys
+from pathlib import Path
+
+# project root on path so database / models / config are importable
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import json
+import queue
+import threading
+import requests as http
+from flask import Flask, jsonify, request, abort, render_template, Response, stream_with_context, send_file
+from werkzeug.utils import secure_filename
+from database import BookRepository
+from find_files import find_online_sources
+from models import Book
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+repo = BookRepository()
+
+FILES_DIR = ROOT / "files"
+FILES_DIR.mkdir(exist_ok=True)
+ALLOWED_EXT = {".pdf", ".epub", ".djvu", ".fb2", ".doc", ".docx"}
+
+
+def book_to_dict(b: Book) -> dict:
+    return {
+        "id": b.id,
+        "title": b.title,
+        "author": b.author,
+        "genre": b.genre,
+        "year": b.year,
+        "publisher": b.publisher,
+        "language": b.language,
+        "isbn": b.isbn,
+        "pages": b.pages,
+        "notes": b.notes,
+        "file_path": b.file_path,
+        "has_file": bool(b.file_path),
+        "processed": bool(b.processed),
+        "date_added": b.date_added,
+    }
+
+
+def dict_to_book(data: dict, book_id: int | None = None, current: Book | None = None) -> Book:
+    def intval(key):
+        v = data.get(key)
+        try:
+            return int(v) if v not in (None, "", "null") else None
+        except (ValueError, TypeError):
+            return None
+
+    return Book(
+        id=book_id,
+        title=data.get("title", "").strip(),
+        author=data.get("author", "").strip(),
+        genre=data.get("genre", "").strip(),
+        year=intval("year"),
+        publisher=data.get("publisher", "").strip(),
+        language=data.get("language", "").strip(),
+        isbn=data.get("isbn", "").strip(),
+        pages=intval("pages"),
+        notes=data.get("notes", "").strip(),
+        processed=bool(data["processed"]) if "processed" in data else bool(current.processed if current else False),
+        date_added=data.get("date_added", ""),
+    )
+
+
+# ── Pages ──────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# ── API ────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/books", methods=["GET"])
+def list_books():
+    query = request.args.get("q", "").strip()
+    field = request.args.get("field", "all")
+    if query:
+        books = repo.search(query, field)
+    else:
+        books = repo.get_all()
+    return jsonify([book_to_dict(b) for b in books])
+
+
+@app.route("/api/books/<int:book_id>", methods=["GET"])
+def get_book(book_id):
+    book = repo.get_by_id(book_id)
+    if not book:
+        abort(404)
+    return jsonify(book_to_dict(book))
+
+
+@app.route("/api/books", methods=["POST"])
+def create_book():
+    data = request.get_json(force=True)
+    if not data.get("title") or not data.get("author"):
+        abort(400, "title and author are required")
+    book = dict_to_book(data)
+    new_id = repo.add_book(book)
+    book.id = new_id
+    return jsonify(book_to_dict(book)), 201
+
+
+@app.route("/api/books/<int:book_id>", methods=["PUT"])
+def update_book(book_id):
+    current = repo.get_by_id(book_id)
+    if not current:
+        abort(404)
+    data = request.get_json(force=True)
+    if not data.get("title") or not data.get("author"):
+        abort(400, "title and author are required")
+    book = dict_to_book(data, book_id=book_id, current=current)
+    repo.update_book(book)
+    return jsonify(book_to_dict(repo.get_by_id(book_id)))
+
+
+@app.route("/api/books/<int:book_id>", methods=["DELETE"])
+def delete_book(book_id):
+    if not repo.get_by_id(book_id):
+        abort(404)
+    repo.delete_book(book_id)
+    return "", 204
+
+
+@app.route("/api/books/<int:book_id>/sources", methods=["GET"])
+def get_book_sources(book_id):
+    book = repo.get_by_id(book_id)
+    if not book:
+        abort(404)
+    return jsonify(find_online_sources(book))
+
+
+@app.route("/api/books/<int:book_id>/processed", methods=["POST"])
+def set_book_processed(book_id):
+    book = repo.get_by_id(book_id)
+    if not book:
+        abort(404)
+    data = request.get_json(force=True)
+    processed = bool(data.get("processed", True))
+    repo.set_processed(book_id, processed)
+    return jsonify(book_to_dict(repo.get_by_id(book_id)))
+
+
+@app.route("/api/bot/find-files")
+def bot_find_files():
+    """SSE: scan books without files, find open-access downloads, stream progress."""
+    def sse(data: dict) -> str:
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def generate():
+        from find_files import find_file_for_book
+        msg_q: queue.Queue = queue.Queue()
+
+        only_recommended = request.args.get("only_recommended", "0") == "1"
+
+        def worker():
+            all_books = [b for b in repo.get_all() if not b.file_path]
+            if only_recommended:
+                all_books = [b for b in all_books if b.genre != "Знайдена література"]
+            books = all_books
+            msg_q.put({"type": "start", "total": len(books)})
+            found = []
+            for i, book in enumerate(books):
+                msg_q.put({"type": "checking", "index": i + 1, "total": len(books),
+                            "title": book.title})
+                result = find_file_for_book(book)
+                if result:
+                    found.append({"book_id": book.id, "title": book.title,
+                                  "author": book.author, **result})
+                    msg_q.put({"type": "found", "book_id": book.id,
+                               "title": book.title, "source": result["source"],
+                               "format": result["format"], "url": result["url"],
+                               "size_mb": result.get("size_mb")})
+            msg_q.put({"type": "done", "found": found})
+            msg_q.put(None)
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            msg = msg_q.get()
+            if msg is None:
+                yield sse({"type": "end"})
+                break
+            yield sse(msg)
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/bot/download", methods=["POST"])
+def bot_download():
+    """Download approved files and attach to books."""
+    items = request.get_json(force=True)  # [{book_id, url, format}, ...]
+    results = []
+    for item in items:
+        book_id = item["book_id"]
+        url     = item["url"]
+        fmt     = item.get("format", "pdf")
+        book    = repo.get_by_id(book_id)
+        if not book:
+            results.append({"book_id": book_id, "ok": False, "error": "not found"})
+            continue
+        try:
+            r = http.get(url, timeout=60, stream=True)
+            r.raise_for_status()
+            from werkzeug.utils import secure_filename as sf
+            safe = f"{book_id}_{sf(book.title[:40])}.{fmt}"
+            dest = FILES_DIR / safe
+            with open(str(dest), "wb") as fh:
+                for chunk in r.iter_content(65536):
+                    fh.write(chunk)
+            repo.set_file_path(book_id, safe)
+            results.append({"book_id": book_id, "ok": True, "file": safe})
+        except Exception as e:
+            results.append({"book_id": book_id, "ok": False, "error": str(e)})
+    return jsonify(results)
+
+
+@app.route("/api/books/<int:book_id>/upload", methods=["POST"])
+def upload_file(book_id):
+    book = repo.get_by_id(book_id)
+    if not book:
+        abort(404)
+    if "file" not in request.files:
+        abort(400, "no file")
+    f = request.files["file"]
+    ext = Path(f.filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        abort(400, f"Unsupported format: {ext}")
+
+    # delete old file if exists
+    if book.file_path:
+        old = FILES_DIR / book.file_path
+        if old.exists():
+            old.unlink()
+
+    safe_name = f"{book_id}_{secure_filename(f.filename)}"
+    dest = FILES_DIR / safe_name
+    f.save(str(dest))
+    repo.set_file_path(book_id, safe_name)
+    return jsonify({"file": safe_name}), 200
+
+
+@app.route("/api/books/<int:book_id>/file", methods=["DELETE"])
+def delete_file(book_id):
+    book = repo.get_by_id(book_id)
+    if not book:
+        abort(404)
+    if book.file_path:
+        p = FILES_DIR / book.file_path
+        if p.exists():
+            p.unlink()
+        repo.set_file_path(book_id, "")
+    return "", 204
+
+
+@app.route("/files/<int:book_id>")
+def open_file(book_id):
+    book = repo.get_by_id(book_id)
+    if not book or not book.file_path:
+        abort(404)
+    path = FILES_DIR / book.file_path
+    if not path.exists():
+        abort(404)
+    return send_file(str(path), as_attachment=False)
+
+
+@app.route("/api/stats")
+def stats():
+    books = repo.get_all()
+    genres: dict[str, int] = {}
+    for b in books:
+        genres[b.genre or "Інше"] = genres.get(b.genre or "Інше", 0) + 1
+    return jsonify({"total": repo.count(), "by_genre": genres})
+
+
+# ── Search page ────────────────────────────────────────────────────────────────
+
+@app.route("/search")
+def search_page():
+    return render_template("search.html")
+
+
+@app.route("/files-manager")
+def files_manager():
+    return render_template("files.html")
+
+
+@app.route("/link-files")
+def link_files():
+    return render_template("link.html")
+
+
+# ── OneDrive browser ───────────────────────────────────────────────────────────
+
+BOOK_EXTENSIONS = {".pdf", ".epub", ".djvu", ".fb2", ".doc", ".docx"}
+
+
+@app.route("/api/onedrive/browse")
+def onedrive_browse():
+    """Return folder tree: {subfolders: [{name, files: [{name, path, ext}]}]}"""
+    import re
+    folder_str = request.args.get("folder", "").strip()
+    if not folder_str:
+        return jsonify({"error": "folder param required"}), 400
+    root = Path(folder_str)
+    if not root.is_dir():
+        return jsonify({"error": f"Not a directory: {folder_str}"}), 400
+
+    subfolders = []
+    # Collect files directly in root
+    root_files = [p for p in sorted(root.iterdir())
+                  if p.is_file() and p.suffix.lower() in BOOK_EXTENSIONS]
+    if root_files:
+        subfolders.append({
+            "name": "(корінь)",
+            "files": [{"name": p.name, "path": str(p), "ext": p.suffix.lstrip(".")} for p in root_files],
+        })
+
+    # Subdirectories
+    for sub in sorted(root.iterdir()):
+        if not sub.is_dir():
+            continue
+        files = [p for p in sorted(sub.rglob("*"))
+                 if p.is_file() and p.suffix.lower() in BOOK_EXTENSIONS]
+        if files:
+            subfolders.append({
+                "name": sub.name,
+                "files": [{"name": p.name, "path": str(p), "ext": p.suffix.lstrip(".")} for p in files],
+            })
+
+    return jsonify({"subfolders": subfolders})
+
+
+@app.route("/api/books/<int:book_id>/link-onedrive", methods=["POST"])
+def link_onedrive_file(book_id):
+    """Copy a file from OneDrive path and attach it to the book."""
+    import re
+    book = repo.get_by_id(book_id)
+    if not book:
+        abort(404)
+    data = request.get_json(force=True)
+    src_path = Path(data.get("path", ""))
+    if not src_path.is_file():
+        return jsonify({"error": f"File not found: {src_path}"}), 400
+    if src_path.suffix.lower() not in BOOK_EXTENSIONS:
+        return jsonify({"error": "Unsupported file type"}), 400
+
+    # Delete old file if exists
+    if book.file_path:
+        old = FILES_DIR / book.file_path
+        if old.exists():
+            old.unlink()
+
+    safe_name = f"{book_id}_{re.sub(r'[^a-zA-Z0-9._-]', '_', src_path.name)}"
+    dest = FILES_DIR / safe_name
+    import shutil
+    if not dest.exists():
+        shutil.copy2(str(src_path), str(dest))
+    repo.set_file_path(book_id, safe_name)
+    return jsonify({"ok": True, "file": safe_name})
+
+
+@app.route("/api/onedrive/auto-link", methods=["POST"])
+def onedrive_auto_link():
+    """
+    Auto-match OneDrive folder files to catalog books by folder→genre mapping.
+    Body: { folder, apply: bool }
+    Returns: { pairs: [{book_id, book_title, file_path, file_name, folder}], unmatched_books, unmatched_files }
+    """
+    import re, shutil
+    from collections import defaultdict
+
+    data = request.get_json(force=True)
+    folder_str = data.get("folder", "").strip()
+    apply = bool(data.get("apply", False))
+
+    root = Path(folder_str)
+    if not root.is_dir():
+        return jsonify({"error": f"Not a directory: {folder_str}"}), 400
+
+    # Folder name → genre mapping (Ukrainian folder names → Czech genre names in catalog)
+    FOLDER_TO_GENRE = {
+        "дитинство":               "Dětské zubní lékařství",
+        "ортодонтія":              "Ortodoncie",
+        "ортопедія":               "Protetika",
+        "парадонтологіє":          "Parodontologie",
+        "парадонтологія":          "Parodontologie",
+        "терапевтична":            "Konzervační zubní lékařství",
+        "хірургія":                "Orální chirurgie",
+        "фармакологія":            "Farmakologie",
+        "соціальна медицина асорті": None,   # skip
+        "скошушки конспекти":      None,     # skip
+    }
+
+    def pick_representative(files):
+        """From a group of Підшивка parts, pick the best single file."""
+        # Prefer file without "Частина"
+        main = [f for f in files if not re.search(r'частина', f.name, re.I)]
+        if main:
+            return sorted(main)[0]
+        # Prefer _Частина1 (not _Частина10, _Частина11 etc.)
+        part1 = [f for f in files if re.search(r'Частина1(?!\d)', f.name, re.I)]
+        if part1:
+            return part1[0]
+        return sorted(files)[0]
+
+    def group_files_by_number(files):
+        """Group files by Підшивка number → {1: best_file, 2: best_file, ...}"""
+        groups = defaultdict(list)
+        for f in files:
+            m = re.search(r'[Пп]ідшивка(\d+)', f.name)
+            if m:
+                groups[int(m.group(1))].append(f)
+        return {num: pick_representative(group) for num, group in sorted(groups.items())}
+
+    books_by_genre = defaultdict(list)
+    for b in repo.get_all():
+        if not b.file_path:
+            books_by_genre[b.genre or ""].append(b)
+
+    pairs = []
+    unmatched_books = []
+    unmatched_files = []
+
+    for sub in sorted(root.iterdir()):
+        if not sub.is_dir():
+            continue
+        genre = FOLDER_TO_GENRE.get(sub.name.lower())
+        if genre is None:
+            continue  # explicitly skipped folder
+
+        files_in_folder = [p for p in sorted(sub.rglob("*"))
+                           if p.is_file() and p.suffix.lower() in BOOK_EXTENSIONS]
+        file_groups = group_files_by_number(files_in_folder)
+
+        genre_books = sorted(books_by_genre.get(genre, []), key=lambda b: b.title)
+
+        used_nums = set()
+        for idx, book in enumerate(genre_books):
+            # Try file group by 1-based index
+            num = idx + 1
+            if num in file_groups:
+                pairs.append({
+                    "book_id":    book.id,
+                    "book_title": book.title,
+                    "file_path":  str(file_groups[num]),
+                    "file_name":  file_groups[num].name,
+                    "folder":     sub.name,
+                    "genre":      genre,
+                })
+                used_nums.add(num)
+            else:
+                unmatched_books.append({"id": book.id, "title": book.title, "genre": genre})
+
+        for num, f in file_groups.items():
+            if num not in used_nums:
+                unmatched_files.append({"name": f.name, "folder": sub.name})
+
+    if apply:
+        for pair in pairs:
+            src = Path(pair["file_path"])
+            book = repo.get_by_id(pair["book_id"])
+            if not book or not src.is_file():
+                continue
+            safe_name = f"{book.id}_{re.sub(r'[^a-zA-Z0-9._-]', '_', src.name)}"
+            dest = FILES_DIR / safe_name
+            if not dest.exists():
+                shutil.copy2(str(src), str(dest))
+            repo.set_file_path(book.id, safe_name)
+            pair["saved_as"] = safe_name
+
+    return jsonify({
+        "pairs":           pairs,
+        "unmatched_books": unmatched_books,
+        "unmatched_files": unmatched_files,
+        "applied":         apply,
+    })
+
+
+@app.route("/api/search/online")
+def search_online():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify([])
+
+    results = []
+
+    # ── OpenLibrary ──────────────────────────────────────────────────────────
+    try:
+        ol = http.get(
+            "https://openlibrary.org/search.json",
+            params={"q": q, "limit": 20, "fields": "key,title,author_name,first_publish_year,publisher,isbn,language,number_of_pages_median"},
+            timeout=8,
+        ).json()
+        for doc in ol.get("docs", []):
+            authors = doc.get("author_name") or []
+            isbn_list = doc.get("isbn") or []
+            langs = doc.get("language") or []
+            results.append({
+                "source": "OpenLibrary",
+                "title": doc.get("title", ""),
+                "author": ", ".join(authors[:3]),
+                "year": doc.get("first_publish_year"),
+                "publisher": (doc.get("publisher") or [""])[0],
+                "isbn": isbn_list[0] if isbn_list else "",
+                "language": langs[0].upper() if langs else "",
+                "pages": doc.get("number_of_pages_median"),
+                "notes": f"OpenLibrary key: {doc.get('key','')}",
+            })
+    except Exception as e:
+        print(f"OpenLibrary error: {e}")
+
+    # ── Google Books (fallback / supplement) ─────────────────────────────────
+    if len(results) < 5:
+        try:
+            gb = http.get(
+                "https://www.googleapis.com/books/v1/volumes",
+                params={"q": q, "maxResults": 15, "printType": "books"},
+                timeout=8,
+            ).json()
+            for item in gb.get("items", []):
+                info = item.get("volumeInfo", {})
+                isbns = {i["type"]: i["identifier"] for i in info.get("industryIdentifiers", [])}
+                results.append({
+                    "source": "Google Books",
+                    "title": info.get("title", ""),
+                    "author": ", ".join(info.get("authors", [])[:3]),
+                    "year": int(info.get("publishedDate", "0")[:4]) if info.get("publishedDate") else None,
+                    "publisher": info.get("publisher", ""),
+                    "isbn": isbns.get("ISBN_13") or isbns.get("ISBN_10", ""),
+                    "language": info.get("language", "").upper(),
+                    "pages": info.get("pageCount"),
+                    "notes": info.get("description", "")[:300] if info.get("description") else "",
+                })
+        except Exception as e:
+            print(f"Google Books error: {e}")
+
+    # deduplicate by title+author
+    seen, unique = set(), []
+    for r in results:
+        key = (r["title"].lower(), r["author"].lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    return jsonify(unique[:30])
+
+
+@app.route("/api/bot/run")
+def bot_run():
+    """Server-Sent Events stream: runs the bot and pushes live progress."""
+    q_str = request.args.get("q", "").strip()
+    limit = min(int(request.args.get("limit", 20)), 60)
+    if not q_str:
+        return jsonify({"error": "query required"}), 400
+
+    def sse(data: dict) -> str:
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def generate():
+        msg_queue: queue.Queue = queue.Queue()
+
+        def bot_thread():
+            from bot import search_openlibrary, search_googlebooks, search_crossref, deduplicate, save_to_db
+
+            def push(msg_type, **kwargs):
+                msg_queue.put({"type": msg_type, **kwargs})
+
+            push("status", text=f"Запускаю пошук для «{q_str}»…")
+            all_results = []
+
+            for src_name, fn in [
+                ("OpenLibrary", lambda: search_openlibrary(q_str, limit)),
+                ("Google Books", lambda: search_googlebooks(q_str, limit)),
+                ("CrossRef",     lambda: search_crossref(q_str, limit)),
+            ]:
+                push("source_start", source=src_name)
+                found = fn()
+                push("source_done", source=src_name, count=len(found))
+                all_results += found
+                import time; time.sleep(0.2)
+
+            unique = deduplicate(all_results)
+            push("status", text=f"Дедублікація: {len(all_results)} → {len(unique)} унікальних")
+
+            push("status", text="Зберігаю в базу даних…")
+            added, skipped = save_to_db(unique)
+            push("done", added=added, skipped=skipped, total=repo.count())
+            msg_queue.put(None)  # sentinel
+
+        threading.Thread(target=bot_thread, daemon=True).start()
+
+        while True:
+            msg = msg_queue.get()
+            if msg is None:
+                yield sse({"type": "end"})
+                break
+            yield sse(msg)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/api/search/save", methods=["POST"])
+def save_found_book():
+    data = request.get_json(force=True)
+    if not data.get("title"):
+        abort(400, "title is required")
+
+    def intval(k):
+        v = data.get(k)
+        try:
+            return int(v) if v not in (None, "", "null") else None
+        except (ValueError, TypeError):
+            return None
+
+    book = Book(
+        title=data["title"].strip(),
+        author=data.get("author", "").strip(),
+        genre="Знайдена література",
+        year=intval("year"),
+        publisher=data.get("publisher", "").strip(),
+        language=data.get("language", "").strip(),
+        isbn=data.get("isbn", "").strip(),
+        pages=intval("pages"),
+        notes=data.get("notes", "").strip(),
+    )
+    new_id = repo.add_book(book)
+    book.id = new_id
+    return jsonify(book_to_dict(book)), 201
+
+
+if __name__ == "__main__":
+    print("Book Catalog web server starting on http://localhost:5000")
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+
+from pathlib import Path
+
+# Ensure the project root is on sys.path so imports work regardless of CWD
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from tkinter import messagebox
+from ui.app_window import BookCatalogApp
+
+
+def main():
+    try:
+        app = BookCatalogApp()
+        app.mainloop()
+    except Exception as exc:
+        messagebox.showerror("Помилка запуску", str(exc))
+        raise
+
+
+if __name__ == "__main__":
+    main()
+
+from dataclasses import dataclass, field
+from datetime import date
+
+
+@dataclass
+class Book:
+    title: str
+    author: str
+    genre: str = ""
+    year: int | None = None
+    publisher: str = ""
+    language: str = ""
+    isbn: str = ""
+    pages: int | None = None
+    notes: str = ""
+    file_path: str = ""
+    processed: bool = False
+    date_added: str = field(default_factory=lambda: date.today().isoformat())
+    id: int | None = None
+
+"""
+OneDrive ↔ Catalog sync script
+Scans OneDrive for book files, fuzzy-matches them to DB records,
+and links matches (copies file reference into the catalog).
+
+Usage:
+    python sync_onedrive.py              # scan & report
+    python sync_onedrive.py --apply      # scan, report, and link matches
+    python sync_onedrive.py --threshold 60   # lower match threshold (default 70)
+    python sync_onedrive.py --folder "C:/Users/vlad_/OneDrive/SomeFolder"
+"""
+import sys
+import re
+import shutil
+import argparse
+from pathlib import Path
+from difflib import SequenceMatcher
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from database import BookRepository
+from config import BASE_DIR
+
+ONEDRIVE_ROOT = Path("C:/Users/vlad_/OneDrive")
+FILES_DIR     = BASE_DIR / "files"
+FILES_DIR.mkdir(exist_ok=True)
+
+BOOK_EXTENSIONS = {".pdf", ".epub", ".djvu", ".fb2", ".doc", ".docx"}
+
+# Files likely to be tests/study notes rather than actual books
+TEST_PATTERNS = re.compile(
+    r"test|testy|otázk|zkoušk|státnic|cvičn|подшив|vypracovan|"
+    r"srz|srž|opakov|otazk|1[\.\s]část|2[\.\s]část|část\s*\d|"
+    r"^\d+[\.\s]část|\bpart\b",
+    re.I
+)
+
+
+# ── Text normalisation ────────────────────────────────────────────────────────
+
+def normalise(text: str) -> str:
+    """Lowercase, strip accents roughly, remove punctuation/numbers prefix."""
+    t = text.lower()
+    # remove leading numbering like "10_", "18 "
+    t = re.sub(r"^\d+[_\s\.\-]+", "", t)
+    # replace underscores / dashes with space
+    t = re.sub(r"[_\-]+", " ", t)
+    # remove extension
+    t = re.sub(r"\.(pdf|epub|djvu|fb2|docx?)$", "", t)
+    # collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalise(a), normalise(b)).ratio() * 100
+
+
+def keyword_overlap(filename: str, book_title: str) -> float:
+    """Fraction of significant title words that appear as whole words in the filename."""
+    stopwords = {"a", "i", "v", "z", "k", "o", "s", "the", "and", "of",
+                 "in", "an", "for", "to", "kol", "et", "al", "ve", "ze"}
+    fname_words = set(re.split(r"\W+", normalise(filename)))
+    title_words = [w for w in re.split(r"\W+", normalise(book_title))
+                   if len(w) > 2 and w not in stopwords]
+    if not title_words:
+        return 0.0
+    hits = sum(1 for w in title_words if w in fname_words)
+    return hits / len(title_words) * 100
+
+
+def author_bonus(filename: str, author: str) -> float:
+    """Extra points if author's last name appears in filename."""
+    if not author:
+        return 0.0
+    last_names = [p.strip().split()[0].lower()
+                  for p in author.split(",")[:2] if p.strip()]
+    fname = normalise(filename)
+    return 15.0 if any(ln in fname for ln in last_names if len(ln) > 3) else 0.0
+
+
+def score(filename: str, book_title: str, author: str = "") -> float:
+    if TEST_PATTERNS.search(filename):
+        return 0.0  # never match test/exam files
+    base = max(similarity(filename, book_title),
+               keyword_overlap(filename, book_title))
+    return min(100.0, base + author_bonus(filename, author))
+
+
+# ── File scanning ─────────────────────────────────────────────────────────────
+
+def scan_files(root: Path) -> list[Path]:
+    result = []
+    for p in root.rglob("*"):
+        if p.suffix.lower() in BOOK_EXTENSIONS:
+            result.append(p)
+    return result
+
+
+# ── Matching ──────────────────────────────────────────────────────────────────
+
+def match_files_to_books(files: list[Path], books, threshold: float):
+    """
+    Returns:
+      matched   – [(book, file, score)]
+      unmatched_files  – [file]
+      books_no_file    – [book]
+    """
+    matched: list[tuple] = []
+    used_files: set[Path] = set()
+    used_books: set[int]  = set()
+
+    # For each book, find the best-scoring file
+    candidates = []
+    for book in books:
+        if book.file_path:          # already has a file in catalog
+            continue
+        best_file, best_score = None, 0.0
+        for f in files:
+            s = score(f.name, book.title, book.author)
+            if s > best_score:
+                best_score, best_file = s, f
+        if best_file and best_score >= threshold:
+            candidates.append((best_score, book, best_file))
+
+    # Sort by score descending; greedily assign (one file → one book)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    for sc, book, f in candidates:
+        if book.id in used_books or f in used_files:
+            continue
+        matched.append((book, f, sc))
+        used_books.add(book.id)
+        used_files.add(f)
+
+    unmatched_files  = [f for f in files if f not in used_files]
+    books_no_file    = [b for b in books if b.id not in used_books and not b.file_path]
+    return matched, unmatched_files, books_no_file
+
+
+# ── Link ──────────────────────────────────────────────────────────────────────
+
+def link_match(repo: BookRepository, book, src_path: Path) -> str:
+    """Copy file to catalog files/ folder and update DB."""
+    safe_name = f"{book.id}_{re.sub(r'[^a-zA-Z0-9._-]', '_', src_path.name)}"
+    dest = FILES_DIR / safe_name
+    if not dest.exists():
+        shutil.copy2(str(src_path), str(dest))
+    repo.set_file_path(book.id, safe_name)
+    return safe_name
+
+
+# ── Report ────────────────────────────────────────────────────────────────────
+
+def print_report(matched, unmatched_files, books_no_file, apply: bool):
+    W = 70
+    print("\n" + "=" * W)
+    print(" ЗВІТ СИНХРОНІЗАЦІЇ OneDrive ↔ Каталог")
+    print("=" * W)
+
+    print(f"\n✅ ЗНАЙДЕНО ЗБІГИ ({len(matched)}):")
+    print("-" * W)
+    for book, f, sc in sorted(matched, key=lambda x: -x[2]):
+        status = "→ ПРИВ'ЯЗАНО" if apply else "→ (запусти з --apply)"
+        print(f"  [{sc:5.1f}%]  📖 {book.title[:45]:<45}")
+        print(f"             📄 {f.name}")
+        print(f"             {status}")
+        print()
+
+    print(f"\n📚 КНИГИ БЕЗ ФАЙЛУ ({len(books_no_file)}):")
+    print("-" * W)
+    for b in books_no_file:
+        print(f"  • {b.title[:60]}")
+
+    print(f"\n📁 НЕЗІСТАВЛЕНІ ФАЙЛИ З ONEDRIVE ({len(unmatched_files)}):")
+    print("-" * W)
+    # Show only book-like files (skip test files, etc.)
+    interesting = [f for f in unmatched_files
+                   if not re.search(r"test|testy|otázk|zkoušk|státnic|cvičn|подшив",
+                                    f.name, re.I)]
+    for f in interesting[:30]:
+        print(f"  • {f.name}")
+    if len(interesting) > 30:
+        print(f"  … та ще {len(interesting)-30} файлів")
+
+    print("\n" + "=" * W)
+    print(f" Збіги: {len(matched)}  |  Без файлу: {len(books_no_file)}  |  Нерозпізнано: {len(unmatched_files)}")
+    print("=" * W + "\n")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync OneDrive files with book catalog")
+    parser.add_argument("--apply",     action="store_true", help="Link matched files to catalog")
+    parser.add_argument("--threshold", type=float, default=70, help="Match threshold %% (default 70)")
+    parser.add_argument("--folder",    default=str(ONEDRIVE_ROOT), help="OneDrive root folder")
+    args = parser.parse_args()
+
+    root = Path(args.folder)
+    print(f"\n🔍 Сканую: {root}")
+    files = scan_files(root)
+    print(f"   Знайдено файлів: {len(files)}")
+
+    repo  = BookRepository()
+    books = repo.get_all()
+    print(f"   Книг у каталозі: {len(books)}")
+    print(f"   Порогова схожість: {args.threshold}%\n")
+
+    matched, unmatched_files, books_no_file = match_files_to_books(
+        files, books, args.threshold
+    )
+
+    if args.apply:
+        print("⚙  Прив'язую знайдені файли…")
+        for book, f, sc in matched:
+            saved = link_match(repo, book, f)
+            print(f"   ✓ {book.title[:50]} ← {f.name}")
+        repo.close()
+
+    print_report(matched, unmatched_files, books_no_file, args.apply)
+
+
+if __name__ == "__main__":
+    main()
+
+D:\Новая папка\книги для gpt\Базы тестов все что только существуют\12)Zkouška .pdf
+D:\Новая папка\книги для gpt\Базы тестов все что только существуют\13)Стоматология осень 2015.pdf
+D:\Новая папка\книги для gpt\Базы тестов все что только существуют\15Новые_тесты_по_стоматологии_2019_2.pdf
+D:\Новая папка\книги для gpt\Базы тестов все что только существуют\17)Combined Tests.pdf
+D:\Новая папка\книги для gpt\Базы тестов все что только существуют\21)Konspekt.pdf
+D:\Новая папка\книги для gpt\Базы тестов все что только существуют\23)Новые тесты мои.pdf
+D:\Новая папка\книги для gpt\детсво\Detska-stomatologie---Kominek.pdf
+D:\Новая папка\книги для gpt\детсво\FIALOVÁ_S_,_NOVÁKOVÁ_K_Vybrané_kapitoly.pdf
+D:\Новая папка\книги для gpt\детсво\Ivančakova-dětské zubní lékařství.pdf
+D:\Новая папка\книги для gpt\детсво\которые можно сразу загружать\111Vývojové_a_získané_poruchy_zubů_a_tvrdých_zubních_tkání_Merglová.pdf
+D:\Новая папка\книги для gpt\детсво\которые можно сразу загружать\K ---   Pedo-Handzel,-Navarová.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\05---(B5)Zaklady-ustni-a-celistni-traumatologie.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\4)Hubálková.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\4_MUTSCHELKNAUSS_R_E_Praktická_parodontologie_–_klinické_postupy.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Holá,Fassman.Repet.onem.ÚS.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Kilian J.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Minčík. J.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Mutschelknauss.Praktická parodontologie.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\parodontologie Hellwig.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Repetitorium_parodontologie_-_Starosta (2).pdf
+D:\Новая папка\книги для gpt\догрузить осталось\SlezĂˇk_prakticka_parodontologie.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Zákolady-ústní-a-čelistní-chirurgie--Pazdera.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Дитяча пдф 1.2.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\Дитяча пдф.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\разделить книги Шедого и добавить\Jiří Šedý Kompendium l.pdf
+D:\Новая папка\книги для gpt\догрузить осталось\разделить книги Шедого и добавить\Jiří Šedý Kompendium ll.pdf
+D:\Новая папка\книги для gpt\Конзервачни\Kilian J. Prevence-ve-stomatologii.pdf
+D:\Новая папка\книги для gpt\Конзервачни\Minčík. J. Kariologie.pdf
+D:\Новая папка\книги для gpt\Конзервачни\которые можно сразу загружать\Konzervacni zubni lekarstvi. J. Stejskalova (2).pdf
+D:\Новая папка\книги для gpt\Конзервачни\которые можно сразу загружать\Minčík. J.pdf
+D:\Новая папка\книги для gpt\Конзервачни\которые можно сразу загружать\Zaklady-klinicke-endodoncie-(Perinka).pdf
+D:\Новая папка\книги для gpt\Конзервачни\которые можно сразу загружать\Záchovná Hellwig ZSP ocr.pdf
+D:\Новая папка\книги для gpt\Ортодонтия\Ortodontický_průvodce_praktického_zubního_lékaře_KOŤOVÁ_M_.pdf
+D:\Новая папка\книги для gpt\Ортодонтия\которые можно сразу загружать\KOŤOVÁ snímací ortodontické přístroje.pdf
+D:\Новая папка\книги для gpt\Ортодонтия\которые можно сразу загружать\Ortodoncie- KAMÍNEK M..pdf
+D:\Новая папка\книги для gpt\Ортодонтия\которые можно сразу загружать\tmppg-li.pdf
+D:\Новая папка\книги для gpt\осталось доделать сканы\Jiří Šedý Kompendium l.pdf
+D:\Новая папка\книги для gpt\осталось доделать сканы\Jiří Šedý Kompendium ll.pdf
+D:\Новая папка\книги для gpt\Пародонтология\SlezĂˇk_prakticka_parodontologie.pdf
+D:\Новая папка\книги для gpt\Пародонтология\которые можно сразу загружать\Parodontologicke_minimum_pro_prekliniku_nove.pdf
+D:\Новая папка\книги для gpt\Протетика\1)Strub. Protetika 1.pdf
+D:\Новая папка\книги для gpt\Протетика\10)Zicha. Částečné snímatelné náhrady.pdf
+D:\Новая папка\книги для gpt\Протетика\4)Hubálková. Materiály a technologie.pdf
+D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\1)Strub.pdf
+D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\2)Strub. Protetika ll.pdf
+D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\3)Strub. Protetika lll.pdf
+D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\5a)Dostálová. Fixni a snimatelna protetika.pdf
+D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\8)Svoboda. Stomatologická propedeutika.pdf
+D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\9)Hubálková. Fixní zubní náhrady.pdf
+D:\Новая папка\книги для gpt\Хирургия\05---(B5)Zaklady-ustni-a-celistni-traumatologie.pdf
+D:\Новая папка\книги для gpt\Хирургия\09 - (A5)Rukověť zubního lékaře.pdf
+D:\Новая папка\книги для gpt\Хирургия\Zákolady-ústní-a-čelistní-chirurgie--Pazdera.pdf
+D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\1_Plán_ošetření_při_poranění_zubů_Mitsuhiro_Tsukiboshi.pdf
+D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\Chirurgie.pdf
+D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\Kostní_tkáňové_inženýrství_v_orofaciální_oblasti_Antonín.pdf
+D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\стомат хирургия  Hrušak.pdf
+
+status,source_path,filename,title,file_hash,chunk_count,language
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Дитинство\Підшивка1.pdf,Підшивка1.pdf,aa,33b8e799352b99ebfee5ffe34f5d39822193606e86694ecdabeff384fbb9480c,1393,ca
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Дитинство\Підшивка2.pdf,Підшивка2.pdf,3,c50b866575266ed3a84a5bed7cdc029e6b5a3e90d485a63d31ee0e055eeb2854,598,hr
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Дитинство\Підшивка3_Частина1.pdf,Підшивка3_Частина1.pdf,P 10799,e69fdaa5d07ae5e229ce4b69bac4e5707e8a9125c4d01f55ca2603e53257ed48,136,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Дитинство\Підшивка3_Частина2.pdf,Підшивка3_Частина2.pdf,10.2 Gingivitidy,61d280c2a3bed2b757f8ae5686b3d5310be523b22dad44f2daa4fb2c6014dd09,98,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Дитинство\Підшивка4.pdf,Підшивка4.pdf,Info,1abe889dc2673d43b635d04a2c61db727f43d9f0987fa6fcc6b3086137d47818,462,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1.pdf,Підшивка1_dfd78b72.pdf,1.) ZÁKLADNÍ GNATOLOGICKÉ POJMY A JEJICH VYUŽITÍ,dfd78b721204bd6f741065d8dcae8c978d163f01ea7d463665880e62cf60d251,1001,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина1.pdf,Підшивка1_Частина1.pdf,stomatologicka protetika,f1275841f95340184b980dac50929767d8723c211eb5819717b6edec557ddc77,38,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина10.pdf,Підшивка1_Частина10.pdf,"Yala na model, alebo sa zakresli na model",e1e58c749b2c82266191588a50608808368c6f8e0be8bd7f4e7b00d3faca7e5b,76,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина11.pdf,Підшивка1_Частина11.pdf,defektu do inej,d1d2525844012c975454a9d82996c2abe635da26544290a9d5bb8f614282c93f,97,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина2.pdf,Підшивка1_Частина2.pdf,‘Trnove,3892c7dd6aabf1f01c3db09739a948a3beab665695fd38993222f38376b72ddc,38,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина3.pdf,Підшивка1_Частина3.pdf,60 Fixni a snimatelnd protetika,1efffddf17fbdbfdec65d51994270b66738ab6449e1d22465b2c4986846ea899,100,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина4.pdf,Підшивка1_Частина4.pdf,J. Krhioulova,1843e1a7cec480cbeaf5e594d6da593cdf3ecfdde356b489e71e02e8e488b525,288,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина5.pdf,Підшивка1_Частина5.pdf,"Tab. 4.4. Tradiani kluifikace zlatilh slitin (up.aveDo podle. M.CABE, Fl. Apglied dedtdl maknols.",37babf7e62567b6b58cf57928ef8ad33dff1515a95b9fb23b6e54797956712fc,308,sl
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина6.pdf,Підшивка1_Частина6.pdf,lll,e20cb4b39e6cbba06bb703755cd312aabf976ee15bed4ac8e8fd29e287296326,260,sl
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина7.pdf,Підшивка1_Частина7.pdf,Obi 20.32. Samopolymerujlci korunkovd prye,d9b92ef70257554d1b5025d2ea68a61affeb24e8839b4a5ad2cf14be26d50545,208,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина8.pdf,Підшивка1_Частина8.pdf,Підшивка1_Частина8,92cea6fea77e3b542d3a3ee56a21a17d5f76b38b3e025c74d352a4eaa8110877,3,unknown
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\Підшивка1_Частина9.pdf,Підшивка1_Частина9.pdf,"‘2 je z karioprofylaktického hlediska nejvyhodnéjxi. Tento typ kavity je nutny i v téch pfipadech, kdy Ize oée-",d9b6449050d71830ab614ab3ef5a15a6d368769b4237d7fb76020f37f2a178fa,98,cs
+missing_source,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Ортопедія\фулл зшивка\Підшивка1.pdf,,cebny plan,e8a50910a61692db201074bff372a0409f5cd452a70b05c5dcf942eb78c0c864,791,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Підшивка1_Частина1.pdf,Підшивка1_Частина1_2c016504.pdf,"PERC, Mg Filles ; seilundidainliie",2c01650470ee768a679dfc0b57a6ec07d387f2dc32db5d0f921c311975961eca,48,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Підшивка1_Частина2.pdf,Підшивка1_Частина2_9b48a541.pdf,"LOW COW LUSLUM 0. ol, Mion Mddeeh tet",9b48a5416da865da9635c90e9869914291c449b584f064c9b99f683f015faebe,46,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Підшивка2.pdf,Підшивка2_bdbb75fa.pdf,o,bdbb75faee3c43d852a7da14b379831b486df9f35d72592a06693f4bd42d490a,419,ca
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Тетрадь з відповідями на усний2відМММ_Частина1.pdf,Тетрадь з відповідями на усний2відМММ_Частина1.pdf,Тетрадь з відповідями на усний.,8462a5be76eb52a45c9f93d1b1825c90860ff2216d68e04d3410e582af3cd30a,37,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Тетрадь з відповідями на усний2відМММ_Частина2.pdf,Тетрадь з відповідями на усний2відМММ_Частина2.pdf,Тетрадь з відповідями на усний.,1ce90fdf0fb472e983a889af37b3e5b6bcfbf2b6b0a1ae3d91c0d05e0bb29fa9,49,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Тетрадь з відповідями на усний2відМММ_Частина3.pdf,Тетрадь з відповідями на усний2відМММ_Частина3.pdf,Тетрадь з відповідями на усний.,59e96e734984c088d09be02b269a88035e9c78bbd9d9f088a9909df5145b6734,37,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Тетрадь з відповідями на усний2відМММ_Частина4.pdf,Тетрадь з відповідями на усний2відМММ_Частина4.pdf,Тетрадь з відповідями на усний.,d636a0f8628631df50f157a69529d22bc08b90373681e43c1443af0f30478c6c,37,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Тетрадь з відповідями на усний2відМММ_Частина5.pdf,Тетрадь з відповідями на усний2відМММ_Частина5.pdf,Тетрадь з відповідями на усний.,3dc009af20e2b7ea3b5a9fadb283243907a37af332cafb5f8c70f24c53d2645c,34,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Скошушки конспекти\Тетрадь з відповідями на усний2відМММ_Частина6.pdf,Тетрадь з відповідями на усний2відМММ_Частина6.pdf,Тетрадь з відповідями на усний.,145f20bf9046da517667d281dfd856f263c98956ec366ef15a5e87c24d02123c,35,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина1.pdf,Підшивка1_Частина1_809a135a.pdf,Oo 9 8 o,809a135a517c3f78d4f7a35b96d2cf9d6f17065979123eb39f5636fd55324824,28,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина10.pdf,Підшивка1_Частина10_97a1169c.pdf,"měnitelné. SÍ'inrulace gingivy se provádí tak, Že kuželík se zavede do nrezizubního prostoru hrotem k oklu-",97a1169c93be78002d5c000d684052290741c66ad216b41d8c151e2db1e54305,452,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина11.pdf,Підшивка1_Частина11_50ccb5b5.pdf,4. Neni nebezpedi vzniku spary disl€d-,50ccb5b5a4acb989b2fb325f010fae1d0926d0965470789a969aba9b2313a51d,79,sl
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина2.pdf,Підшивка1_Частина2_3d8203fa.pdf,Endodoncie,3d8203fa92d40bcffd748330fc6e69ca2887b3feaaa127bf8e8a322dce22d82c,163,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина3_Частина1_Частина1.pdf,Підшивка1_Частина3_Частина1_Частина1.pdf,prrAp [,252f7b42903a007ee947751c93b8b48de84321d292146b118f7ba36543171c5e,63,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина3_Частина1_Частина2.pdf,Підшивка1_Частина3_Частина1_Частина2.pdf,2 sdomatolog!!,30fc00fecc79280c787d7f56a2a95f54858216a6db012b17bac7c0cfae1edb2e,41,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина3_Частина2.pdf,Підшивка1_Частина3_Частина2.pdf,pomer.n | pale es” eanou @ alusy \ 2 (debbdedukd + off Fatdel ial was,2d46e3a6c9e14820ce8730fb8f4638635b11c8fcfc92b147e8ebed6fc262485b,81,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина4.pdf,Підшивка1_Частина4_ee3c0954.pdf,osetieni defekt tyrdyeh zubnieh thing,ee3c095476f6d26bf03906d38fbbd203e7389b9d4d37e4662a6147dfcdd085c7,114,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина5.pdf,Підшивка1_Частина5_f97ee5f6.pdf,Konzervační ZL,f97ee5f6a8b98b866c0728dc4d241019952f22e027b1a3af914e24290506a3f2,242,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина6.pdf,Підшивка1_Частина6_853924fd.pdf,dalšími typy generalizovaných záchvatů mohou být záchvaty obvykle u starších dětí (3-7 let),853924fd152436f0e4e017a354c94b22a70986c8c07c741caec4ac67ebbaa79e,474,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина7.pdf,Підшивка1_Частина7_fd6e2ac3.pdf,Plеvеoсе vе stomаtoIogii,fd6e2ac3fdc7aec3014b50bf016bfc182d6f004145aac37d99778d5662e1924b,309,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина8.pdf,Підшивка1_Частина8_d2c1804d.pdf,"pocit bolesti. V oblastech, kde jsou receptory pro dotyk, chlad a teplo, ne-",d2c1804d30b94d3978ea118b238bf2a458b94e39dff0df99597c855fc1ebadc2,87,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка1_Частина9.pdf,Підшивка1_Частина9_d1bc7332.pdf,"z,AKLADY",d1bc733214e78393da3e7444e37ab5e0bb340951c9f850fe43ea8fa79085218a,214,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка2.pdf,Підшивка2_d9770cc7.pdf,Doporučená literatura:,d9770cc7eedad82847de03f3248f2ed36136f6b34594d6bce531393be3d014d1,157,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3.pdf,Підшивка3.pdf,INLAYE/ONLAYE/OVERLAYE,d77c41ee44051514f320fea3e25f94df7d9d53242f847566702ec81337ddd855,751,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3_Частина1.pdf,Підшивка3_Частина1_656a1919.pdf,INLAYE/ONLAYE/OVERLAYE,656a1919e24e8d786b29b614ba6f3dc214f8a068898f2fb9ee5e2789b71ed13f,210,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3_Частина2.pdf,Підшивка3_Частина2_92e2e46f.pdf,86,92e2e46faaed3b6da936cd06def074767c8799203babb895dc14867a493c36b0,211,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3_Частина3.pdf,Підшивка3_Частина3.pdf,31,e1027f68fd2dff8f129fc64af5f4a9b4900d2855d0592f08809bd2ba24ba0dca,213,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3_Частина4.pdf,Підшивка3_Частина4.pdf,131,0708149f7ef8755baf112e1e419a66b62fdf5578b66e6c450b44f9a9d76d02c6,116,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3_Частина5.pdf,Підшивка3_Частина5.pdf,L. Pefinka,bb0c6cd0f42cdf2f2e62b17ac4c737a74529db45305d94d276fdd8994f6e1fa0,84,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3_Частина6.pdf,Підшивка3_Частина6.pdf,L Pefinka,3e3a545ca9452d677f25789a9a30e9e78a09812c2bde8dc7d9c553ce0f1129b1,93,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Терапевтична\Підшивка3_Частина7.pdf,Підшивка3_Частина7.pdf,11 Akutni oSetfeni,1b44499a58b666521641be8e4b9ad94b3d7a91631d182372bb6a23a8670c2a48,32,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Фармакологія\Підшивка3.pdf,Підшивка3_4bafb71d.pdf,1 prednaska,4bafb71d560299211f260673d28ff138c8c83c21b92ac98d1cad0bfc97007e06,101,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1.pdf,Підшивка1_fbebf82f.pdf,MASARYKOVA UNIVERZITA V BRNĚ,fbebf82f6541ffbb5d168b359b54456bc79fe4d8b112163cee9b927e78271aa7,1505,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1_Частина1.pdf,Підшивка1_Частина1_e9e9eb45.pdf,MASARYKOVA UNIVERZITA V BRNĚ,e9e9eb454362daf07a83647c8125699ac6747230be1e9e321fd6cfff8c1d925d,174,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1_Частина2.pdf,Підшивка1_Частина2_020b2ed2.pdf,2) Lipom,020b2ed2a8a371ede6991a0bac07d28c8d2e485ada68bd48b14b642068a490bb,193,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1_Частина3.pdf,Підшивка1_Частина3_8f0be280.pdf,7,8f0be28010dba606f2fc63aea60dc4e78a55966241a8083d6b1692155357fa96,272,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1_Частина4.pdf,Підшивка1_Частина4_64294642.pdf,INSTRUMENTARIUM UŽÍVANÉ V DENTOALVEOLRNÍ CHIRURGII.,642946427bae82888b5f83305cfae98920722bef90e2889843cca14ab3587dfa,243,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1_Частина5.pdf,Підшивка1_Частина5_8aac3a4c.pdf,Myomy,8aac3a4c24810cdefe2dd96fa5205855cf4664555ecc8b90169121c3279d213a,257,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1_Частина6.pdf,Підшивка1_Частина6_5b666c6f.pdf,"Kontuze, avulze",5b666c6fe0455b18df5abfb1a40a4e7af271729a7ef84e67d0cb5a34762b2ca1,262,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка1_Частина7.pdf,Підшивка1_Частина7_91462238.pdf,"proliferující epitel roste paprsčitě a síťovitě, přičemž vystýlá dutiny, vzniklé buďto •",9146223899979712f2f73ad551a04d43753496e0c01a10ed3b4a908275e99d6b,103,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина1.pdf,Підшивка2_Частина1.pdf,http://thehaltenclinic.com/our-clinic/,78b1068f84a1e65e1749300ca7059a9b33a83935cd1f7428732a3b1a8e1872be,19,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина10.pdf,Підшивка2_Частина10.pdf,prakticky v kaidém véku a jeji manifestaci éasto predchdzi trauma nervového kmene,11bfee5810bdee7e5714ac0d0f0053b84b5d8c2a28f02cdcba6e66129f5d5b78,20,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина11.pdf,Підшивка2_Частина11.pdf,Lipomy mie a,5a42827b3b7e6d29208491d7e8bdc626c469a27d4ea47d32db4f702d1660f1f7,142,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина2.pdf,Підшивка2_Частина2.pdf,Chirurgicka faze implanta fae),a9cd85c24f7dc0b561693bba5c21762bc88b8781dddb7c7ccd34b458d64f28ad,91,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина3.pdf,Підшивка2_Частина3.pdf,Obr. 258: Transpozice n. alveolaris inferior. N — n. alve-,fb431a54187e8136f17c1bc85fc3f65800c9825b81c3d0e606fd362fd512f1d9,77,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина4.pdf,Підшивка2_Частина4.pdf,Zanety orofacialni oblast,c80662e8cdd0a8e587fb2d4f0a1fe4192427f8f027fad3bfac89a92ab2dd466a,36,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина5.pdf,Підшивка2_Частина5.pdf,Soe ;,09fed02c7901dc7a1d9cf406620cd0e0499fe5c412480910ceec4185148beec5,115,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина6.pdf,Підшивка2_Частина6.pdf,"traktura (omezené otvirani tst), vysoké teploty a celkova alterace nemocného. Piitomnost",513ab04f061c2d16d66c796aa05efaaeaf537f9537b48332b1507856fa900ee2,69,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина7.pdf,Підшивка2_Частина7.pdf,~48—,17549910125068b856b6974678ee16e2907a92e75ab1d20305da5898aabe3a77,130,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина8.pdf,Підшивка2_Частина8.pdf,228,7233c491b5f45edda1c96d44ee4c684219d51caa598c900bbf1a02e5e0f29496,113,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\Хірургія\Підшивка2_Частина9.pdf,Підшивка2_Частина9.pdf,SRZ z orální a maxilofacilární chirurgie 2010,df8f0c0ba6afb0725875d5fab0b538610ebc8920442e848bea15e844ba2fb63d,275,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина1.pdf,Підшивка2_Частина1_e8fd4604.pdf,ORTODONCIE,e8fd4604724d5da990bb714a99a65b6b1d54fd549d95d01dfb8b29b93ad2a8c0,122,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина10.pdf,Підшивка2_Частина10_22c1a613.pdf,DIFERENCIALNi DIAGNOZA TR. ANGLE Ws,22c1a61395d023f909ec0dd15074de28d4c55279ab47d326c7ef8fa1f3f50a1e,30,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина1.pdf,Підшивка2_Частина11_Частина1.pdf,R.R-E.M-S.M.H. viRocnik,871de66eea206bcdd3b1565ba7fa25a93cf50e3d3118f649123745e272f28149,31,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина2.pdf,Підшивка2_Частина11_Частина2.pdf,Hea a a,e8c73357d081fc2f30c7106258b86dcc72d6ba02562f3ce6fc6d2afceb95033f,32,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина3.pdf,Підшивка2_Частина11_Частина3.pdf,i 2,e2d9ef00f302e5ffaaee4fbecb3288e60027bda9cc2813496de64b502ae4c442,37,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина4.pdf,Підшивка2_Частина11_Частина4.pdf,5.6 Rentgenove vysetrer,35c92c867e7df91beeaab94678e0ee820fbf7129c55fa955d9d32dff364c190f,32,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина5.pdf,Підшивка2_Частина11_Частина5.pdf,Vyznam a cile ortodontické lécby,6a545984c51c82e836ad6da9135f30880a4c712f9bc707200a422262ee8a24f8,32,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина6.pdf,Підшивка2_Частина11_Частина6.pdf,V soutasnych rr,e75beb69c7708f95670255499e258cef3896b86bdbe98afdf687406c8a086ffb,47,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина7.pdf,Підшивка2_Частина11_Частина7.pdf,Ukolem ortodontického lééeni je upraveni anomal-,912cffba406051b31850b64d93e81fb2544d0103ab1add989b5aa2dea82b611f,34,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина11_Частина8.pdf,Підшивка2_Частина11_Частина8.pdf,La |,4f3cccdd89dc79734b914383bf45edb16bfc740abdbd403a4c1c820beeedf09e,2,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина1.pdf,Підшивка2_Частина12_Частина1.pdf,Plan lécby,aeee3edaa57d82f4ef66e19053aa1da032ec24e13dd3041a93d55c62477016cf,25,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина2.pdf,Підшивка2_Частина12_Частина2.pdf,e aS es,c8f065cdac0089d804dc7c755adf5e275f5af2d7300ff44a3fac23cb0e15d278,30,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина3.pdf,Підшивка2_Частина12_Частина3.pdf,"ahy jsou fetizky z polyuretanu, Slou",ecbb46d0ecc200acceb81f74153f1a0693c6d7b7564c148a3ca16f190997fbed,44,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина4.pdf,Підшивка2_Частина12_Частина4.pdf,Obr. 11-31.,1446338d003c9a70c781546d1b0a86b799c6845b3c2628aad4117383b8235c61,32,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина5.pdf,Підшивка2_Частина12_Частина5.pdf,BE,cee7051239ee3709309b5f7ee9e32f95f7f1999a96fdcb6067fcacdf7bbc390c,40,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина6.pdf,Підшивка2_Частина12_Частина6.pdf,ae,20367a6878b57aa0720b010c0b84ab6455901629b05f85808b33b938f782de69,44,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина7.pdf,Підшивка2_Частина12_Частина7.pdf,Zvysovani skusu ndkusnou deskou,0e8d3a834110467a3f51186d1726dc4f449c89ab7ac95d282e7f0a08c496f908,45,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина12_Частина8.pdf,Підшивка2_Частина12_Частина8.pdf,212,52ec0441ee0d917dabb410726e09a39fe14a5a490aeb3e1ab88ebacc45756f9b,26,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина13.pdf,Підшивка2_Частина13.pdf,— el,9563b2ec85a1c41b8888c61f7c06ef40351106d516ab350fa6e624498b016ad8,134,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина14.pdf,Підшивка2_Частина14.pdf,uzávěr defektu posuny zubů a jejich případná estetická úprava1.,e82a600545110dd0d4b337b2682886c71002069add1f8be4887c23cec75bb04f,92,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина15.pdf,Підшивка2_Частина15.pdf,7,a2bf77e2b15e085fae123848ec92e6db60b4c6c259957f3f71e15b780138d8ac,115,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина16.pdf,Підшивка2_Частина16.pdf,vII. vHoDNÝvĚK PRo oRToDoNTICKoU rÉČnu,8eec8e2db9e676d06018d1d68d3a85caa5b26363e07988ff24d6a184db6b3531,127,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина17.pdf,Підшивка2_Частина17.pdf,-5L!,1d8de7aeb81147eec4baf49afaf5645b32459e84bd95a1cc0858c3264eea8491,97,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина18.pdf,Підшивка2_Частина18.pdf,a} >,6bd8bfb9b8e02f3e2385dc50b6b61824541022fcf5d4122f5e5684ee086a7786,79,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина19.pdf,Підшивка2_Частина19.pdf,"ew) SS ry ee, Ul Pe ra ay ae a Sata",12b4f5206162f42069877f60bc9738d683b0a419006ee212bcdb499cec5a41cb,74,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина2.pdf,Підшивка2_Частина2_33b5d284.pdf,"Těoto vztah je odvozen od rozdíu v šířce hor[ích a dolních iezáků. Homí střední řezák,",33b5d284ae641081275724fe7db570815169b6d7ca0f330f98bec08ebc9d1c01,96,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина20.pdf,Підшивка2_Частина20.pdf,» Odrézej{c4 a,e19bdb4fe45e3d03d0b561c8922d9c6fca0cdfa3b32fe5778b9099cb2ad20550,107,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина21.pdf,Підшивка2_Частина21.pdf,"80 Ortodonticky, priwvodce praktického zubnino lexare",6104b13ed740c390e5cae68d3856e3a4c74809638f35d58d1a58c44340a77591,140,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина22.pdf,Підшивка2_Частина22.pdf,86 Ortodonticky priivodce praktického zubniho lékare,dffc9309267ea7eae62a5434b7f97ab4ee2865855bf3391933a0b2a4f6208a26,34,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина3.pdf,Підшивка2_Частина3_6ab762f1.pdf,"] IIunňe, v o.:Ranges a[ nonnalcy in the eruption afthe pdmafient teeth, ]' Dent. C]1ild' ]949' 16, s.11-15' Cn: wn",6ab762f178a7acc1883c88426a4a3cd515d8a77a0005ba6e925fcb84dfdb8ff2,121,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина4.pdf,Підшивка2_Частина4_a8f0b9c2.pdf,-9 -,a8f0b9c261f3ecadd9f820546495e48303974668cf381fd310be0e5eea50a0d9,125,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина5.pdf,Підшивка2_Частина5_446553ac.pdf,-6/-,446553ac132a60668b487d8d636b113b0b259ecd881a8d2ffe6f16bf6c8874b0,75,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина6.pdf,Підшивка2_Частина6_79505026.pdf,"Faby,",795050265f2c714b543ae206451d7f88f6428aca2d78e0aa9888d99e74541c0a,84,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина7.pdf,Підшивка2_Частина7_3f364ecb.pdf,"Obr. 61 """,3f364ecb4e08ea57ca7a578033e8d09121e4fa53257b4e05466b650b0e01b351,74,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина8.pdf,Підшивка2_Частина8_e10a98c4.pdf,or todontické leeby ee ic,e10a98c447c6da28b3f7ea0211d9f5cbd0a9de30be8877f3dabdb398a6885d36,133,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка2_Частина9.pdf,Підшивка2_Частина9_5d09555c.pdf,-106 — Ortodonticky privodce praktického zubniho lékare,5d09555ca3ff2eda234d41a6d47be1de30d84a3b622696f13e2f1d0fabbdedb0,106,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка3.pdf,Підшивка3_81c8e32f.pdf,STOMATOLOGIE,81c8e32f09382b65f359a230e0490e7480abe09efd556d67a7e84acff4228dbf,51,en
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\Підшивка4.pdf,Підшивка4_76ce3dce.pdf,28 SMÍŠENÝ CHRUP A ORTODONTICKÁ LÉČBA,76ce3dce39e10cccd1d65a62b66c443078c2043debf6cdfe1a7d2f20d2bd36f5,250,cs
+missing_source,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\повна підшивка\Підшивка2.pdf,,ORTODONCIE,be4514e3daab0dcaba50d8458c704403f735b08803112969d34afc4a7f15fe96,1001,cs
+missing_source,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\повна підшивка\Підшивка2_Частина11.pdf,,R.R-E.M-S.M.H. viRocnik,45587635bdcd49b782d0291d54f37cebca8bcc90119a9053b0e8c304cca06a30,164,cs
+missing_source,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\ортодонтія\повна підшивка\Підшивка2_Частина12.pdf,,Plan lécby,6b5e3b049d613837db9cf3cd39bd50ca87b34b09da7c2c379acda414c78ae4d3,203,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_1.pdf,Пародонтологія_1.pdf,ortodoncie,4986f18d98e4d60f392860583aa507c7761424e4278c3277e30b8320eccb82f4,488,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_1.pdf,Пародонтологія_3_1.pdf,I-Í3w,aeaec32d9d6c8b30291bfe64a98b02117efc466ee935a44e20cf321b9db997ab,287,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_10.pdf,Пародонтологія_3_10.pdf,parodontalnich choboti a odli8it pravé a nepravé choboty (hyperplazie gingivy mohou skryvat zdvazna,3309b313ae1dace7474dae7e101caba51eedf6c4cffcf6663fd517d965bea565,131,sk
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_11.pdf,Пародонтологія_3_11.pdf,"vyuzitim ve tkanich. Na latkové vyméné se také podili Zlazy s vnitini sekreci , jejichZ poruchy mohou",0f19b2287821c081ec950d09c54e4fd4965a7d2f0f4d7324c7be5b2c5d50867a,132,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_12.pdf,Пародонтологія_3_12.pdf,"naleznou v¥razné snéuky- zanétu, Obdobnd tomu. je u lingua plicata, u néhoz",cdb0dd4f10cad382ec11720396ee24afc25b54b556f2223c2592180c5768a614,121,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_13.pdf,Пародонтологія_3_13.pdf,Etiologie parodontopatií,6b694aed0f190805ca4475ca32354db07784c5a429496292ea1547397422fd1a,252,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_14.pdf,Пародонтологія_3_14.pdf,"vývojová odchylka, vyskytuje se v každém věku zhruba u 2-10 % populace, familiární výskyt, často",40e2d996427e0d29c32a7726626394813114d083e0c99d244f4652596959438a,301,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_15.pdf,Пародонтологія_3_15.pdf,Heinz Erpenstein,9c9cf45a3e0055062bfab5344e572012622464f0923e1761bf890981fe440fee,214,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_16.pdf,Пародонтологія_3_16.pdf,"Ralf E. Mutschelknauss, Brigitte Simon",b76ab125225b4b59baa65db02b60c2ae50e2eeb90f60fce666647e648beb0142,189,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_17.pdf,Пародонтологія_3_17.pdf,A/ TERMINOLOGICKE POZNAMKY,90ca50a328f1bc0b5651f895c4966fb6f0464cbaef3e522c88b7b3d1c686ce35,231,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_18.pdf,Пародонтологія_3_18.pdf,"i v děloze, vaječnících, prsu a varlatech řadí tento syndrom k prekancerózám a kožním (a slizničním) paraneoplaziím.",88a842a6cca1b44eb2244d2f6e44e7fe5c6684019d28d91aa35f081a657f46aa,320,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_19.pdf,Пародонтологія_3_19.pdf,Pod pojem parodontopatie zahrnujeme jak zdnétlivé,991974f9f62cc639e6a110571b25018a2edbf49e6f68f51f5be174678ee786b9,123,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_2.pdf,Пародонтологія_3_2.pdf,tel,c599b1f9c62cab7b371e866e2bd03ec403cb2f0a632140c279695d2bf4b8f566,265,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_3.pdf,Пародонтологія_3_3.pdf,Lez,92471198cec6121e9bed32bcd02384fe60d7a437987cbd016d3099ff054eff75,222,ca
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_4.pdf,Пародонтологія_3_4.pdf,eve,a52f7aecfa64d196ccdc41b651bd5c638952ae403fc5bf128887a8f94bdfe2a9,225,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_5.pdf,Пародонтологія_3_5.pdf,egn,dd77fe5ed482cf3f1647b17bd3427899be1b5a7b474bfadfd2d86266e6f903ec,180,ca
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_5_1.pdf,Пародонтологія_3_5_1.pdf,96ý,1f33c3418892abf15971a206a35411c614b96123e834a8e6cea683bf04db312c,97,ca
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_5_2.pdf,Пародонтологія_3_5_2.pdf,3 • Epiclexnioloqie Plakem podmíněných parodontopaLI í,ffcf217ec62330e1f1615e430209cfb9ea508c768af15391b5d4b6bfdc183b25,98,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_6_1.pdf,Пародонтологія_3_6_1.pdf,* sieloge ae,52842b09a4a41810fee58d43fa07fd9d349137c09d5a65380ef5ee47de873aaf,74,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_6_2.pdf,Пародонтологія_3_6_2.pdf,"mene RNachazime vySsi viskozitu sliny,. v ediisledku lepsi stabi-",ab26d0e60980dafed1e1070e54bb250a95ca051b9b9c79c4a566dadab69e6995,69,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_7.pdf,Пародонтологія_3_7.pdf,Radova Slezih,b9b73cf8ec99eabbcdfa3c38b217b2b25aef7b547997482400fe8c3e3108f111,96,ro
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_8.pdf,Пародонтологія_3_8.pdf,Piiiice,75e5b3d7153ad822349e9cf0ac768b551999d088cbdf288206e867c97806f44f,227,sl
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_9.pdf,Пародонтологія_3_9.pdf,l2 - rorcn(ijtna notignijovya noti3nrntdory,b2ce19933e716649e0b37d37315c7bc05fd09008eb03e7f0864415f0301559ca,59,ca
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_9_1.pdf,Пародонтологія_3_9_1.pdf,i,60c0afb48e2329facaae63721363698344feddbaf81bc13f9153de7aac47288b,99,nl
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_3_9_2.pdf,Пародонтологія_3_9_2.pdf,"vyskytuje pii infekéni mononukleéze (navic byva poviakova angina, hepatomegalie, typické zmény",c49a65c2aef422bd4ba6ed149ab7f45b0ad7a72197da7742dd00b2fc33172746,109,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5.pdf,Пародонтологія_5.pdf,MDDR.EVA BUCHALOVÁ,06d18e1c199010828978b334dfd84b32b11a2b500c09e2c20c31d26e7d5b0c3a,1249,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_1.pdf,Пародонтологія_5_1.pdf,MDDR.EVA BUCHALOVÁ,ba1422afbe87d694383c3df05ae40eb1b6cdd70124448bb217c7d992cda89f45,95,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_10.pdf,Пародонтологія_5_10.pdf,106,210bd1c27c5b6fd0de151b8602d0686e6c7223d98b47b3e7b36f13db5aea4a6a,219,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_11.pdf,Пародонтологія_5_11.pdf,49,deb4a36df0544dc636a0e5615ffa811564db2c42d01394b8af3e5faf3b48a3ca,215,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_12.pdf,Пародонтологія_5_12.pdf,149,6f54b6d96470e61cd662cc5393b8d0e9029cd53ea4686aed21f6d2c7fb4732ae,21,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_2.pdf,Пародонтологія_5_2.pdf,• Nejčastější,1d442f5ea217455dc7da8416aa6676301fb7248449242ca6abe2567b85d98f3a,75,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_3.pdf,Пародонтологія_5_3.pdf,Obecné zásady,7ea1463addc3a7d37e8ce894a001435d67e032f8bd7b5f9d1d364318a0709551,64,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_4.pdf,Пародонтологія_5_4.pdf,Klasifikace 2017,02c5ae3e16e0bc987e4c6f54e671ed5e7c00424a87f74ac60997b583ca998df6,65,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_5.pdf,Пародонтологія_5_5.pdf,• Paralelní poloha koncovky,ea6835d615d9adff7b40b4af921e2284f525eabce04a42f4a64d156c63ce93fb,71,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_6.pdf,Пародонтологія_5_6.pdf,Překrytí krčku - koronárně posunutý lalok,6b4ab770ce05ea4d27b6517cd8f1ae6b51c3a4aa04c6091b59468dfa504a6272,88,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_7.pdf,Пародонтологія_5_7.pdf,Terapie a prognóza,063464963e79ed7dedb5d79927c45c57ce8afe7f447d51551f659828d558d4fe,68,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_8.pdf,Пародонтологія_5_8.pdf,DLAHOVÁNÍ,b6d69a25024b81be4e95c03e9a00c4d6ab52ec6156380084499e91d49061979d,74,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Пародонтологія_5_9.pdf,Пародонтологія_5_9.pdf,6,d8ac8607169085a108c5c73591aaf48f36e21945757b4cc4bf4fac69daa6e8b9,192,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Підшивка3_Частина1.pdf,Підшивка3_Частина1_b5f90037.pdf,I-Í3w,b5f90037a6018c3937fc81f97471f5ede0915e39f6595fc9369ce43edafe970c,423,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Підшивка3_Частина2.pdf,Підшивка3_Частина2_42edafea.pdf,9Ll,42edafea5b1240c31082720944d33551b795c9239a1c866aa3e14c338c1abb22,204,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Підшивка3_Частина3.pdf,Підшивка3_Частина3_6c7a605d.pdf,LLE,6c7a605df4c9cd3777df1f9bfce81dceee8c39192d1319eb78fd9a4e0d16b8fb,206,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Підшивка3_Частина4.pdf,Підшивка3_Частина4_1cca4563.pdf,"Reiner Mengel, Lavin Flores-de-Jacoby",1cca4563f5ecdc9a3d971d88242ad63097c1449199d9dec9e190e3c74f0cd6a5,208,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Підшивка3_Частина5.pdf,Підшивка3_Частина5_18b98809.pdf,Ralf E. Mutschelknauss,18b988096ed7293596e5e35c8df90773c23fb40a6cb9b3395a3098d1a9adc77c,105,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Підшивка3_Частина6.pdf,Підшивка3_Частина6_63f0f70a.pdf,* sieloge ae,63f0f70a40a5529709d2863c359150717df340b2ee989eaf41c45ef647d4055b,74,cs
+skipped_duplicate_hash,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\парадонтологіє\Підшивка5.pdf,,MDDR.EVA BUCHALOVÁ,06d18e1c199010828978b334dfd84b32b11a2b500c09e2c20c31d26e7d5b0c3a,1249,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\соціальна медицина асорті\Підшивка1_Частина1.pdf,Підшивка1_Частина1_b8aaa084.pdf,MASARYKOVA UNIVERZITA,b8aaa084965ed31bdc8cc9c0819d66fed1b56de59af789006d5b11fe725d8fde,834,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\соціальна медицина асорті\Підшивка1_Частина2.pdf,Підшивка1_Частина2_949bdad6.pdf,Negativní reverz,949bdad6be343111091dc3d3bba7e5a7d2f51d29d32029bd4e47d6fadca00e9f,325,cs
+copy,C:\Users\vlad_\OneDrive\Desktop\Апробаційні книжки та лекції\соціальна медицина асорті\Підшивка1_Частина3.pdf,Підшивка1_Частина3_daba8c7b.pdf,n,daba8c7bc0ea685246a0603f9a32f8d7bf7a7d9619b0caf92eb35758df8930ab,14,en
+copy,D:\Новая папка\книги для gpt\Базы тестов все что только существуют\12)Zkouška .pdf,12)Zkouška.pdf,"!!!!!!Коллеги, давайте заполнять исключительно на чешском, я думаю",6bcd2971de33fdd3dd37bcd9a0878e6746a171bd7454fbb9b05d00e58aea1692,20,cs
+copy,D:\Новая папка\книги для gpt\Базы тестов все что только существуют\13)Стоматология осень 2015.pdf,13)Стоматология осень 2015.pdf,Стоматология осень 2015,89e0dba532d5467373739acf5c7d09dfc34d63a08a24a21d86aa4458936ecbef,20,ru
+copy,D:\Новая папка\книги для gpt\Базы тестов все что только существуют\15Новые_тесты_по_стоматологии_2019_2.pdf,15Новые_тесты_по_стоматологии_2019_2.pdf,1),4a1b0565c0485ba9bc5f16456694ada34966f044c90a2e8305c5103f3bcf929b,28,ru
+copy,D:\Новая папка\книги для gpt\Базы тестов все что только существуют\17)Combined Tests.pdf,17)Combined Tests.pdf,Test: konzervační + endodoncie,13faf882355513e43f84796e405f7f7a2028bcb031a8073d619dc55f8e17b898,38,cs
+copy,D:\Новая папка\книги для gpt\Базы тестов все что только существуют\21)Konspekt.pdf,21)Konspekt.pdf,Scanned Image,d03d4b5e9f9149040bbe887bba2fe1367e157042ed163cf55ede7064bbb2d89b,95,cs
+copy,D:\Новая папка\книги для gpt\Базы тестов все что только существуют\23)Новые тесты мои.pdf,23)Новые тесты мои.pdf,Новые тесты мои,2df35ad971f3d877ea9112679b68083c6579ca3837545828cb9f2165efc693e2,64,cs
+copy,D:\Новая папка\книги для gpt\Конзервачни\Kilian J. Prevence-ve-stomatologii.pdf,Kilian J. Prevence-ve-stomatologii.pdf,Fotografie na celou strnku,addc394225cde1ddde2f26b13e207d03177ddf7fe4e2429cfa391273642adca3,144,de
+copy,D:\Новая папка\книги для gpt\Конзервачни\Minčík. J. Kariologie.pdf,Minčík. J. Kariologie.pdf,Kariologie,627506cf16d3a762627d6fddf0b454d3e74f587c99bf3e8dcd1d1af87d161208,83,sk
+copy,D:\Новая папка\книги для gpt\Конзервачни\которые можно сразу загружать\Konzervacni zubni lekarstvi. J. Stejskalova (2).pdf,Konzervacni zubni lekarstvi. J. Stejskalova (2).pdf,JITKA STEJSKALOVÁ,18fcc7eaf55fb2c2d3d24a0e7fd3f5efa932e46735295880012837557977b932,717,cs
+copy,D:\Новая папка\книги для gpt\Конзервачни\которые можно сразу загружать\Zaklady-klinicke-endodoncie-(Perinka).pdf,Zaklady-klinicke-endodoncie-(Perinka).pdf,ka,3784d96123ea42840b5a5244366358a0a69e93b30d1855fe6bb16e9725c62232,460,sk
+copy,D:\Новая папка\книги для gpt\Конзервачни\которые можно сразу загружать\Záchovná Hellwig ZSP ocr.pdf,Záchovná Hellwig ZSP ocr.pdf,", ,",fac5f4108ac0215d58896474e6173b6cfcec70c4d1ccfac57a1893cbe96c264f,1012,cs
+copy,D:\Новая папка\книги для gpt\Ортодонтия\Ortodontický_průvodce_praktického_zubního_lékaře_KOŤOVÁ_M_.pdf,Ortodontický_průvodce_praktického_zubního_lékaře_KOŤOVÁ_M_.pdf,Ortodonticky pruvodce praktickeho zubnicho lekare,4f6e6bd0bbad882e9f2503b21c20ab086ec41d68ec2a3799fc0ab4586c408f22,140,cs
+copy,D:\Новая папка\книги для gpt\Ортодонтия\которые можно сразу загружать\KOŤOVÁ snímací ortodontické přístroje.pdf,KOŤOVÁ snímací ortodontické přístroje.pdf,Magdalena Koťová,8e0e6697308009946c6e4027d12b420cbd6c33a55a76e8487b2938ae4fcaf032,109,cs
+copy,D:\Новая папка\книги для gpt\Ортодонтия\которые можно сразу загружать\Ortodoncie- KAMÍNEK M..pdf,Ortodoncie- KAMÍNEK M.pdf,Ortodoncie,12c876bbf16a615d215fb95eed68b88ba9945dc589283e7bd6c00775675f93f4,833,nl
+copy,D:\Новая папка\книги для gpt\Ортодонтия\которые можно сразу загружать\tmppg-li.pdf,tmppg-li.pdf,Ortodonticky pruvodce praktickeho zubnicho lekare,d94750e0b1446e430f74a6c91cb0ceebad230b700fead0c91b95cdd273153fb0,224,cs
+copy,D:\Новая папка\книги для gpt\Пародонтология\SlezĂˇk_prakticka_parodontologie.pdf,SlezĂˇk_prakticka_parodontologie.pdf,RADOVAN SLEZAK,fcd734a7cd4cae414e21254ef9aef4083db3f65ba644cc818cb3bba3e0cce8e0,183,cs
+copy,D:\Новая папка\книги для gpt\Пародонтология\которые можно сразу загружать\Parodontologicke_minimum_pro_prekliniku_nove.pdf,Parodontologicke_minimum_pro_prekliniku_nove.pdf,Parodontologické minimum pro  prekliniku,a62f6c1f0daa09ee4713c359c6006f8c265d56c42d47863ba1ef01aff44f7872,81,cs
+copy,D:\Новая папка\книги для gpt\Протетика\1)Strub. Protetika 1.pdf,1)Strub. Protetika 1.pdf,"J. R. Strub, M. Kern, J. C. Tiirp, S. Witkowski, G. Heydecke, S. Wolfart",1826dcc5eb40c36ce5875f6143bc7ec78879731e15f877d3a713fc681fd83527,83,sk
+copy,D:\Новая папка\книги для gpt\Протетика\10)Zicha. Částečné snímatelné náhrady.pdf,10)Zicha. Částečné snímatelné náhrady.pdf,OBSAH,a229e5a9697f21021c0424c37e5c96cb44d82be9fc8f9cd9641f92357d59e37c,95,cs
+copy,D:\Новая папка\книги для gpt\Протетика\4)Hubálková. Materiály a technologie.pdf,4)Hubálková. Materiály a technologie.pdf,a,2dac1e544b6617373343e7e23aee38f9dfdeee1ff74350a8262f028ed4766088,88,sk
+copy,D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\1)Strub.pdf,1)Strub.pdf,"^^^,^^^1^^^^^^^,.,^^,,^^^,^,^^^",297c441a7f4c3c64b7aa957ee6ca25f402bfca14b20910c71175bcb029e725ef,767,cs
+copy,D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\2)Strub. Protetika ll.pdf,2)Strub. Protetika ll.pdf,K 9í 415,5e01b6096bb77cd4a8a9676b7bbe50feddb3aec70e178ec19fb8258c8e3937ac,983,cs
+copy,D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\3)Strub. Protetika lll.pdf,3)Strub. Protetika lll.pdf,K 9í643,29ca6cfa41085574ec20a31baa29f917737048e0cd54ff50fa35b886a9cf95c0,1003,cs
+copy,D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\5a)Dostálová. Fixni a snimatelna protetika.pdf,5a)Dostálová. Fixni a snimatelna protetika.pdf,Fixní a snímatelná protetika,72be95c8bd638f54fbe3b7ada146314a43150c9dc5d76c11ec6418810a78dac6,371,bn
+copy,D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\8)Svoboda. Stomatologická propedeutika.pdf,8)Svoboda. Stomatologická propedeutika.pdf,",l",1d5a758b519e23b8b8a463a0c38d4c681a7367cdff3db16920a76818e4abe38f,752,cs
+copy,D:\Новая папка\книги для gpt\Протетика\которые можно сразу загружать\9)Hubálková. Fixní zubní náhrady.pdf,9)Hubálková. Fixní zubní náhrady.pdf,g~,86e94373171591d9955bf2549d0093a83a8aadfa5bddf0e3b2c09c94a103c95d,366,cs
+copy,D:\Новая папка\книги для gpt\Хирургия\05---(B5)Zaklady-ustni-a-celistni-traumatologie.pdf,05---(B5)Zaklady-ustni-a-celistni-traumatologie.pdf,K 89856,62344c4383e317c5268fe3e88fd295ee0a52b2423842e30f1c931b7d21e8c3f2,70,sk
+copy,D:\Новая папка\книги для gpt\Хирургия\09 - (A5)Rukověť zubního lékaře.pdf,09 - (A5)Rukověť zubního lékaře.pdf,EDICE ZUBNIHO LEKARSTVI,869419b9af4bb0354baca1e6fb596588367d022989a71bb7e9096446a6cc01a9,96,sl
+copy,D:\Новая папка\книги для gpt\Хирургия\Zákolady-ústní-a-čelistní-chirurgie--Pazdera.pdf,Zákolady-ústní-a-čelistní-chirurgie--Pazdera.pdf,Základy ústní a čelistní chirurgie,d29cf6dbb609e460031d15d652335dfcdff437d3bd7d2c394d786c7ca75c2352,82,nl
+copy,D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\1_Plán_ošetření_při_poranění_zubů_Mitsuhiro_Tsukiboshi.pdf,1_Plán_ošetření_při_poranění_zubů_Mitsuhiro_Tsukiboshi.pdf,K 89013,98a3031b4ae41c6fc97bb78988075bd05111a7d01285bcde22838b33254eb9b3,385,cs
+copy,D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\Chirurgie.pdf,Chirurgie.pdf,Zpracovala: Gabriela Rucká,23d8c62eb544c74e845dc23349b08371e7d65f2907c6609e310a810d2b07d163,306,cs
+copy,D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\Kostní_tkáňové_inženýrství_v_orofaciální_oblasti_Antonín.pdf,Kostní_tkáňové_inženýrství_v_orofaciální_oblasti_Antonín.pdf,K 80794,f77746cbfa1f156cde415819e3a945df3effe7aefd558b55ade884de7391019b,294,cs
+copy,D:\Новая папка\книги для gpt\Хирургия\которые можно сразу загружать\стомат хирургия  Hrušak.pdf,стомат хирургия Hrušak.pdf,DANIEL HRUŠÁK A KOLEKTIV,0846058370410c47fa32e7e7e8b4526f92c2ed381b54ec16c4c0cf7204a2c777,744,cs
+copy,D:\Новая папка\книги для gpt\детсво\Detska-stomatologie---Kominek.pdf,Detska-stomatologie---Kominek.pdf,aa,a9daca46f5cb6fa8e6d0c455743c9314d91f9f7c8b9a2ed8f9a3983443c9a41c,280,ca
+copy,"D:\Новая папка\книги для gpt\детсво\FIALOVÁ_S_,_NOVÁKOVÁ_K_Vybrané_kapitoly.pdf","FIALOVÁ_S_,_NOVÁKOVÁ_K_Vybrané_kapitoly.pdf",Vybrane kapitoly z pedostomatologie,b712c062cc74eebc16c44391b8548fdb8f779a16b3715461efb8df2635fa90fa,112,en
+copy,D:\Новая папка\книги для gpt\детсво\Ivančakova-dětské zubní lékařství.pdf,Ivančakova-dětské zubní lékařství.pdf,Ivančakova-dětské zubní lékařství,7d133e46d864856aaf437061375c4022fdbf57fad3b2e6d6015db48c0e04579e,172,en
+copy,D:\Новая папка\книги для gpt\детсво\которые можно сразу загружать\111Vývojové_a_získané_poruchy_zubů_a_tvrdých_zubních_tkání_Merglová.pdf,111Vývojové_a_získané_poruchy_zubů_a_tvrdých_zubních_tkání_Merglová.pdf,",",1e6417e891a38f65aba7c2fc61810f649b00c11436e99ed6fc2f2ee65fc38369,243,cs
+copy,"D:\Новая папка\книги для gpt\детсво\которые можно сразу загружать\K ---   Pedo-Handzel,-Navarová.pdf","K --- Pedo-Handzel,-Navarová.pdf",1,862a4482bcfbd3fa355ee69bb21d218acf3beece4d8ee35a7ea25c5824c70657,971,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\05---(B5)Zaklady-ustni-a-celistni-traumatologie.pdf,05---(B5)Zaklady-ustni-a-celistni-traumatologie_103a4a7b.pdf,K 89£56 M,103a4a7b127db39df77720d55a03c835e56de76d47526eb2c52012d81431e073,328,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\4)Hubálková.pdf,4)Hubálková.pdf,ae,fd936368310607492ea0de7d6d1f8a4c47239359de335e5857dce2ca53f678ed,780,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\4_MUTSCHELKNAUSS_R_E_Praktická_parodontologie_–_klinické_postupy.pdf,4_MUTSCHELKNAUSS_R_E_Praktická_parodontologie_–_klinické_postupy.pdf,Ralf E. Mutschelknauss,2d44152ae7b5899b765687abcd3ef8e9b48b0b5ba59fb19a3535f4ca672123e1,1417,de
+copy,"D:\Новая папка\книги для gpt\догрузить осталось\Holá,Fassman.Repet.onem.ÚS.pdf","Holá,Fassman.Repet.onem.ÚS.pdf",MASARYKOVA UNIVERZITA V BRNĚ,412ae3dcc09ba4dc2de9335ea91a258d12dbb59761b934161cf4032beaa1e44a,259,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\Kilian J.pdf,Kilian J.pdf,Fotografie na celou strnku,d8d0ea217be08d8a108ef44ba1172a0c377f7db352553409d7a386cc463ce042,835,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\Minčík. J.pdf,Minčík. J.pdf,Kariologie,b2fca400155d517c64fd9cbe8590ff4445c972c37b6db16de415d2ea3b37e236,627,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\Mutschelknauss.Praktická parodontologie.pdf,Mutschelknauss.Praktická parodontologie.pdf,paro,c8a09d1deb06f720733855585e8559473b3b291078076424dadad551966ba9ab,1047,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\Repetitorium_parodontologie_-_Starosta (2).pdf,Repetitorium_parodontologie_-_Starosta (2).pdf,REPETITORIUM,5fd85ce58d82ee4f76fe737371c3de865dc3e3dd9f93fb93f5b60e9f891faffc,60,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\SlezĂˇk_prakticka_parodontologie.pdf,SlezĂˇk_prakticka_parodontologie_2db5315c.pdf,RADOVAN SLEZAK,2db5315c3fcd84e97de7db1b281eec09830efe00ba415e6e96e6a5a4aee0a4cc,328,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\Zákolady-ústní-a-čelistní-chirurgie--Pazdera.pdf,Zákolady-ústní-a-čelistní-chirurgie--Pazdera_46998e6a.pdf,Základy ústní a čelistní chirurgie,46998e6a129665ef0f9f2d6c389954a55af2010568cfa2f16e989924e47ecf42,513,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\parodontologie Hellwig.pdf,parodontologie Hellwig.pdf,ZÁCHOVNÁ,903d8b6be038b6809b2f2ddf8ad9d5f44a719b532657206cc405c73f89dda63c,1013,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\Дитяча пдф 1.2.pdf,Дитяча пдф 1.2.pdf,Дитяча,d22ea6dbd52ecf18f4f8c51860b7a7520ea6d731baf642df26ca44815fe237ce,87,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\Дитяча пдф.pdf,Дитяча пдф.pdf,Дитяча,5cc828ae7be9b6904e87c60e04aa1c0ad5353bc62482fd5311838d54efc65b20,40,ru
+copy,D:\Новая папка\книги для gpt\догрузить осталось\разделить книги Шедого и добавить\Jiří Šedý Kompendium l.pdf,Jiří Šedý Kompendium l.pdf,K 88219,d3b2f2e8c1fe5cb323581bef159c24b15d4ddc50fd687a9c84c4f9755f14c936,6231,cs
+copy,D:\Новая папка\книги для gpt\догрузить осталось\разделить книги Шедого и добавить\Jiří Šedý Kompendium ll.pdf,Jiří Šedý Kompendium ll.pdf,TRITON,f25edee1c42b53d1d557bf2a288bcaed91ee1c3f18017ca7c3476c5204ab1b42,6146,cs
+
+"""
+Literature Search Bot
+Usage:
+    python bot.py "periodontology"
+    python bot.py "oral surgery implants" --limit 30
+    python bot.py "dětská stomatologie" --lang cs
+"""
+import sys
+import argparse
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import requests
+from database import BookRepository
+from models import Book
+
+REPO = BookRepository()
+
+SOURCES = ["openlibrary", "googlebooks", "crossref"]
+
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+
+def search_openlibrary(query: str, limit: int) -> list[dict]:
+    print("  [OpenLibrary] Шукаю…", end=" ", flush=True)
+    try:
+        r = requests.get(
+            "https://openlibrary.org/search.json",
+            params={
+                "q": query, "limit": limit,
+                "fields": "key,title,author_name,first_publish_year,publisher,isbn,language,number_of_pages_median"
+            },
+            timeout=10,
+        )
+        docs = r.json().get("docs", [])
+        results = []
+        for doc in docs:
+            authors = doc.get("author_name") or []
+            isbns   = doc.get("isbn") or []
+            langs   = doc.get("language") or []
+            results.append({
+                "source": "OpenLibrary",
+                "title":     doc.get("title", "").strip(),
+                "author":    ", ".join(authors[:3]),
+                "year":      doc.get("first_publish_year"),
+                "publisher": (doc.get("publisher") or [""])[0],
+                "isbn":      isbns[0] if isbns else "",
+                "language":  langs[0].upper() if langs else "",
+                "pages":     doc.get("number_of_pages_median"),
+                "notes":     f"OpenLibrary: {doc.get('key', '')}",
+            })
+        print(f"знайдено {len(results)}")
+        return results
+    except Exception as e:
+        print(f"помилка: {e}")
+        return []
+
+
+def search_googlebooks(query: str, limit: int) -> list[dict]:
+    print("  [Google Books] Шукаю…", end=" ", flush=True)
+    try:
+        r = requests.get(
+            "https://www.googleapis.com/books/v1/volumes",
+            params={"q": query, "maxResults": min(limit, 40), "printType": "books"},
+            timeout=10,
+        )
+        items = r.json().get("items", [])
+        results = []
+        for item in items:
+            info  = item.get("volumeInfo", {})
+            isbns = {i["type"]: i["identifier"] for i in info.get("industryIdentifiers", [])}
+            year  = None
+            pd = info.get("publishedDate", "")
+            if pd and len(pd) >= 4 and pd[:4].isdigit():
+                year = int(pd[:4])
+            results.append({
+                "source":    "Google Books",
+                "title":     info.get("title", "").strip(),
+                "author":    ", ".join(info.get("authors", [])[:3]),
+                "year":      year,
+                "publisher": info.get("publisher", ""),
+                "isbn":      isbns.get("ISBN_13") or isbns.get("ISBN_10", ""),
+                "language":  info.get("language", "").upper(),
+                "pages":     info.get("pageCount"),
+                "notes":     (info.get("description", "")[:300] or ""),
+            })
+        print(f"знайдено {len(results)}")
+        return results
+    except Exception as e:
+        print(f"помилка: {e}")
+        return []
+
+
+def search_crossref(query: str, limit: int) -> list[dict]:
+    """CrossRef — наукові статті та книги з DOI."""
+    print("  [CrossRef]    Шукаю…", end=" ", flush=True)
+    try:
+        r = requests.get(
+            "https://api.crossref.org/works",
+            params={"query": query, "rows": limit},
+            headers={"User-Agent": "BookCatalogBot/1.0 (mailto:catalog@local)"},
+            timeout=10,
+        )
+        msg = r.json().get("message", {})
+        items = msg.get("items", []) if isinstance(msg, dict) else []
+        results = []
+        for item in items:
+            titles  = item.get("title") or []
+            authors = item.get("author") or []
+            author_str = ", ".join(
+                f"{a.get('family', '')} {a.get('given', '')}".strip()
+                for a in authors[:3]
+            )
+            year = None
+            pub = item.get("published-print") or item.get("published-online") or {}
+            pp = pub.get("date-parts", [[]])[0] if isinstance(pub, dict) else []
+            if pp:
+                year = pp[0]
+            isbns = item.get("ISBN") or []
+            results.append({
+                "source":    "CrossRef",
+                "title":     titles[0].strip() if titles else "",
+                "author":    author_str,
+                "year":      year,
+                "publisher": item.get("publisher", ""),
+                "isbn":      isbns[0] if isbns else "",
+                "language":  item.get("language", "").upper(),
+                "pages":     None,
+                "notes":     (item.get("abstract", "") or "")[:300],
+            })
+        print(f"знайдено {len(results)}")
+        return results
+    except Exception as e:
+        print(f"помилка: {e}")
+        return []
+
+
+# ── Dedup + Save ──────────────────────────────────────────────────────────────
+
+def deduplicate(results: list[dict]) -> list[dict]:
+    seen, unique = set(), []
+    for r in results:
+        key = (r["title"].lower().strip(), r["author"].lower().strip())
+        if key[0] and key not in seen:
+            seen.add(key)
+            unique.append(r)
+    return unique
+
+
+def save_to_db(results: list[dict]) -> tuple[int, int]:
+    existing = {(b.title.lower(), b.author.lower()) for b in REPO.get_all()}
+    added, skipped = 0, 0
+    for r in results:
+        key = (r["title"].lower(), r["author"].lower())
+        if key in existing:
+            skipped += 1
+            continue
+        book = Book(
+            title=r["title"],
+            author=r["author"],
+            genre="Знайдена література",
+            year=r.get("year"),
+            publisher=r.get("publisher", ""),
+            language=r.get("language", ""),
+            isbn=r.get("isbn", ""),
+            pages=r.get("pages"),
+            notes=f"[{r['source']}] {r.get('notes','')}".strip(),
+        )
+        REPO.add_book(book)
+        existing.add(key)
+        added += 1
+    return added, skipped
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def run_bot(query: str, limit: int = 20, sources: list[str] | None = None):
+    if sources is None:
+        sources = SOURCES
+
+    print(f"\n{'='*55}")
+    print(f" БОТ ПОШУКУ ЛІТЕРАТУРИ")
+    print(f" Запит : «{query}»")
+    print(f" Ліміт : {limit} на джерело")
+    print(f"{'='*55}\n")
+
+    all_results = []
+
+    if "openlibrary" in sources:
+        all_results += search_openlibrary(query, limit)
+        time.sleep(0.3)
+
+    if "googlebooks" in sources:
+        all_results += search_googlebooks(query, limit)
+        time.sleep(0.3)
+
+    if "crossref" in sources:
+        all_results += search_crossref(query, limit)
+        time.sleep(0.3)
+
+    print(f"\n Разом знайдено : {len(all_results)}")
+    unique = deduplicate(all_results)
+    print(f" Після дедублікації: {len(unique)}")
+
+    print(f"\n Зберігаю в базу даних…")
+    added, skipped = save_to_db(unique)
+
+    print(f"\n{'='*55}")
+    print(f" РЕЗУЛЬТАТ:")
+    print(f"   Додано нових   : {added}")
+    print(f"   Вже існували   : {skipped}")
+    print(f"   Всього в базі  : {REPO.count()}")
+    print(f"{'='*55}\n")
+
+    return added, skipped
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Literature Search Bot")
+    parser.add_argument("query", help="Search query (e.g. 'periodontology')")
+    parser.add_argument("--limit", type=int, default=20, help="Results per source (default: 20)")
+    parser.add_argument(
+        "--sources", nargs="+",
+        choices=SOURCES, default=SOURCES,
+        help="Sources to search (default: all)"
+    )
+    args = parser.parse_args()
+    run_bot(args.query, args.limit, args.sources)
+
+
+if __name__ == "__main__":
+    main()
+
+import csv
+import re
+import sqlite3
+import unicodedata
+from collections import Counter, defaultdict
+from datetime import datetime
+from html import escape
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+BOOKS_DB = ROOT / "books.db"
+DOCS_DB = ROOT / "dental_bot" / "data" / "library.db"
+REPORTS_DIR = ROOT / "reports"
+
+STOPWORDS = {
+    "a",
+    "and",
+    "book",
+    "books",
+    "clinical",
+    "dil",
+    "do",
+    "edition",
+    "et",
+    "al",
+    "i",
+    "ii",
+    "iii",
+    "iv",
+    "kol",
+    "na",
+    "of",
+    "oral",
+    "or",
+    "pro",
+    "s",
+    "the",
+    "u",
+    "v",
+    "vydani",
+    "vydani",
+    "z",
+}
+GENERIC_TITLES = {
+    "",
+    "3",
+    "7",
+    "aa",
+    "cebny plan",
+    "doporucena literatura",
+    "doporu ena literatura",
+    "info",
+    "lll",
+    "o",
+}
+
+
+def main() -> None:
+    REPORTS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = REPORTS_DIR / f"local_holdings_{timestamp}.csv"
+    html_path = REPORTS_DIR / f"local_holdings_{timestamp}.html"
+
+    books_conn = sqlite3.connect(str(BOOKS_DB))
+    books_conn.row_factory = sqlite3.Row
+    docs_conn = sqlite3.connect(str(DOCS_DB))
+    docs_conn.row_factory = sqlite3.Row
+
+    try:
+        books = books_conn.execute(
+            "SELECT id, genre, title, author, year, publisher, file_path FROM books ORDER BY genre, author, title"
+        ).fetchall()
+        docs = docs_conn.execute(
+            "SELECT id, title, path, chunk_count, language, extra_json FROM documents ORDER BY path"
+        ).fetchall()
+        first_chunks = {
+            row["document_id"]: row["text"]
+            for row in docs_conn.execute(
+                "SELECT document_id, text FROM chunks WHERE chunk_index=0"
+            )
+        }
+    finally:
+        docs_conn.close()
+
+    matches: list[dict] = []
+    medium_matches: list[dict] = []
+    matched_doc_paths: set[str] = set()
+
+    for book in books:
+        match = _find_best_match(book, docs, first_chunks)
+        if not match:
+            continue
+        if match["confidence"] == "high":
+            matches.append(match)
+            matched_doc_paths.add(match["doc_path"])
+        elif match["confidence"] == "medium":
+            medium_matches.append(match)
+
+    updated = 0
+    try:
+        for item in matches:
+            if item["current_file_path"] != item["doc_path"]:
+                books_conn.execute(
+                    "UPDATE books SET file_path=? WHERE id=?",
+                    (item["doc_path"], item["book_id"]),
+                )
+                updated += 1
+        books_conn.commit()
+    finally:
+        books_conn.close()
+
+    unmatched_docs = []
+    for doc in docs:
+        if doc["path"] in matched_doc_paths:
+            continue
+        unmatched_docs.append(
+            {
+                "section": _section_from_path(doc["path"]),
+                "title": doc["title"],
+                "clean_title": _clean_title(doc["title"], doc["path"]),
+                "path": doc["path"],
+                "chunk_count": doc["chunk_count"],
+                "language": doc["language"],
+                "generic": _normalize(doc["title"]) in GENERIC_TITLES,
+            }
+        )
+
+    _write_csv(csv_path, matches, medium_matches, unmatched_docs)
+    _write_html(html_path, matches, medium_matches, unmatched_docs, updated)
+
+    print(f"High-confidence holdings: {len(matches)}")
+    print(f"Medium-confidence holdings: {len(medium_matches)}")
+    print(f"Unmatched local docs: {len(unmatched_docs)}")
+    print(f"Updated books.db file_path rows: {updated}")
+    print(f"CSV report: {csv_path}")
+    print(f"HTML report: {html_path}")
+
+
+def _find_best_match(book: sqlite3.Row, docs: list[sqlite3.Row], first_chunks: dict[int, str]) -> dict | None:
+    book_title_norm = _normalize(book["title"])
+    book_title_tokens = _tokens(book["title"])
+    author_tokens = _tokens(book["author"])[:2]
+    if not book_title_tokens:
+        return None
+
+    best: dict | None = None
+    for doc in docs:
+        doc_title_norm = _normalize(doc["title"])
+        path_norm = _normalize(doc["path"])
+        chunk_norm = _normalize(first_chunks.get(doc["id"], "")[:1800])
+
+        title_area = path_norm if doc_title_norm in GENERIC_TITLES else f"{doc_title_norm} {path_norm}"
+        title_hits = sum(1 for token in book_title_tokens if token in title_area)
+        author_hits = sum(1 for token in author_tokens if token in title_area or token in chunk_norm)
+        phrase_hit = book_title_norm in title_area if book_title_norm else False
+        chunk_phrase_hit = book_title_norm in chunk_norm if book_title_norm else False
+
+        score = (title_hits / len(book_title_tokens)) * 0.8
+        if author_tokens:
+            score += (author_hits / len(author_tokens)) * 0.2
+        if phrase_hit:
+            score += 0.5
+        if chunk_phrase_hit and doc_title_norm not in GENERIC_TITLES:
+            score += 0.15
+        if "podshivka" in path_norm or "castina" in path_norm or "cast" in path_norm:
+            score += 0.05
+        if doc_title_norm in GENERIC_TITLES and not phrase_hit:
+            score -= 0.35
+
+        candidate = {
+            "book_id": book["id"],
+            "section": book["genre"],
+            "book_title": book["title"],
+            "book_author": book["author"],
+            "book_year": book["year"] or "",
+            "publisher": book["publisher"] or "",
+            "current_file_path": book["file_path"] or "",
+            "doc_title": doc["title"],
+            "clean_doc_title": _clean_title(doc["title"], doc["path"]),
+            "doc_path": doc["path"],
+            "doc_section": _section_from_path(doc["path"]),
+            "chunk_count": doc["chunk_count"],
+            "language": doc["language"],
+            "score": round(score, 3),
+            "phrase_hit": phrase_hit,
+            "generic_doc_title": doc_title_norm in GENERIC_TITLES,
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+
+    if not best:
+        return None
+    if best["score"] >= 0.8:
+        best["confidence"] = "high"
+        return best
+    if best["score"] >= 0.6:
+        best["confidence"] = "medium"
+        return best
+    return None
+
+
+def _write_csv(path: Path, matches: list[dict], medium_matches: list[dict], unmatched_docs: list[dict]) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["High-confidence holdings"])
+        writer.writerow(
+            [
+                "Section",
+                "Book title",
+                "Author",
+                "Score",
+                "Detected title",
+                "Path",
+                "Folder",
+                "Chunks",
+                "Language",
+            ]
+        )
+        for row in matches:
+            writer.writerow(
+                [
+                    row["section"],
+                    row["book_title"],
+                    row["book_author"],
+                    row["score"],
+                    row["clean_doc_title"],
+                    row["doc_path"],
+                    row["doc_section"],
+                    row["chunk_count"],
+                    row["language"],
+                ]
+            )
+
+        writer.writerow([])
+        writer.writerow(["Medium-confidence holdings"])
+        writer.writerow(
+            [
+                "Section",
+                "Book title",
+                "Author",
+                "Score",
+                "Detected title",
+                "Path",
+                "Folder",
+                "Chunks",
+                "Language",
+            ]
+        )
+        for row in medium_matches:
+            writer.writerow(
+                [
+                    row["section"],
+                    row["book_title"],
+                    row["book_author"],
+                    row["score"],
+                    row["clean_doc_title"],
+                    row["doc_path"],
+                    row["doc_section"],
+                    row["chunk_count"],
+                    row["language"],
+                ]
+            )
+
+        writer.writerow([])
+        writer.writerow(["Unmatched local docs"])
+        writer.writerow(
+            [
+                "Folder",
+                "Detected title",
+                "Original OCR title",
+                "Path",
+                "Chunks",
+                "Language",
+                "Generic OCR title",
+            ]
+        )
+        for row in unmatched_docs:
+            writer.writerow(
+                [
+                    row["section"],
+                    row["clean_title"],
+                    row["title"],
+                    row["path"],
+                    row["chunk_count"],
+                    row["language"],
+                    "yes" if row["generic"] else "no",
+                ]
+            )
+
+
+def _write_html(
+    path: Path,
+    matches: list[dict],
+    medium_matches: list[dict],
+    unmatched_docs: list[dict],
+    updated: int,
+) -> None:
+    counts = Counter(item["section"] for item in matches)
+    unmatched_by_folder = Counter(item["section"] for item in unmatched_docs)
+
+    def rows_for(items: list[dict], *, unmatched: bool = False) -> str:
+        html_rows = []
+        for item in items:
+            if unmatched:
+                html_rows.append(
+                    "<tr>"
+                    f"<td>{escape(item['section'])}</td>"
+                    f"<td>{escape(item['clean_title'])}</td>"
+                    f"<td>{escape(item['title'])}</td>"
+                    f"<td>{item['chunk_count']}</td>"
+                    f"<td>{escape(item['language'])}</td>"
+                    f"<td>{'yes' if item['generic'] else 'no'}</td>"
+                    f"<td>{escape(item['path'])}</td>"
+                    "</tr>"
+                )
+            else:
+                html_rows.append(
+                    "<tr>"
+                    f"<td>{escape(item['section'])}</td>"
+                    f"<td>{escape(item['book_title'])}</td>"
+                    f"<td>{escape(item['book_author'])}</td>"
+                    f"<td>{item['score']}</td>"
+                    f"<td>{escape(item['clean_doc_title'])}</td>"
+                    f"<td>{escape(item['doc_section'])}</td>"
+                    f"<td>{item['chunk_count']}</td>"
+                    f"<td>{escape(item['language'])}</td>"
+                    f"<td>{escape(item['doc_path'])}</td>"
+                    "</tr>"
+                )
+        return "".join(html_rows)
+
+    by_section = "".join(
+        f"<li>{escape(section)}: {count}</li>"
+        for section, count in sorted(counts.items())
+    )
+    unmatched_section = "".join(
+        f"<li>{escape(section)}: {count}</li>"
+        for section, count in sorted(unmatched_by_folder.items())
+    )
+
+    document = f"""<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title>Local holdings report</title>
+  <style>
+    body {{
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      margin: 24px;
+      color: #1f2937;
+      background: #f8fafc;
+    }}
+    h1, h2 {{
+      margin-bottom: 8px;
+    }}
+    .summary {{
+      margin-bottom: 20px;
+      padding: 14px 16px;
+      background: #e0f2fe;
+      border-radius: 12px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 20px;
+    }}
+    .card {{
+      background: white;
+      padding: 14px 16px;
+      border-radius: 12px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+      margin-bottom: 24px;
+    }}
+    th, td {{
+      border: 1px solid #dbe4ee;
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }}
+    th {{
+      background: #dbeafe;
+      position: sticky;
+      top: 0;
+    }}
+    tr:nth-child(even) {{
+      background: #f8fafc;
+    }}
+    .mono {{
+      font-family: Consolas, monospace;
+      word-break: break-all;
+    }}
+  </style>
+</head>
+<body>
+  <h1>Апробаційні книжки та лекції: локальні книжкові знахідки</h1>
+  <div class="summary">
+    <div>High-confidence holdings: {len(matches)}</div>
+    <div>Medium-confidence holdings: {len(medium_matches)}</div>
+    <div>Unmatched local docs: {len(unmatched_docs)}</div>
+    <div>books.db rows updated with file_path: {updated}</div>
+    <div>Generated: {escape(datetime.now().isoformat(timespec="seconds"))}</div>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <h2>High-confidence by section</h2>
+      <ul>{by_section or '<li>—</li>'}</ul>
+    </div>
+    <div class="card">
+      <h2>Unmatched docs by folder</h2>
+      <ul>{unmatched_section or '<li>—</li>'}</ul>
+    </div>
+  </div>
+  <h2>High-confidence holdings</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Section</th>
+        <th>Book title</th>
+        <th>Author</th>
+        <th>Score</th>
+        <th>Detected title</th>
+        <th>Folder</th>
+        <th>Chunks</th>
+        <th>Language</th>
+        <th>Path</th>
+      </tr>
+    </thead>
+    <tbody>{rows_for(matches)}</tbody>
+  </table>
+  <h2>Medium-confidence holdings</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Section</th>
+        <th>Book title</th>
+        <th>Author</th>
+        <th>Score</th>
+        <th>Detected title</th>
+        <th>Folder</th>
+        <th>Chunks</th>
+        <th>Language</th>
+        <th>Path</th>
+      </tr>
+    </thead>
+    <tbody>{rows_for(medium_matches)}</tbody>
+  </table>
+  <h2>Unmatched local docs</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Folder</th>
+        <th>Clean title</th>
+        <th>Original OCR title</th>
+        <th>Chunks</th>
+        <th>Language</th>
+        <th>Generic OCR title</th>
+        <th>Path</th>
+      </tr>
+    </thead>
+    <tbody>{rows_for(unmatched_docs, unmatched=True)}</tbody>
+  </table>
+</body>
+</html>
+"""
+    path.write_text(document, encoding="utf-8")
+
+
+def _clean_title(title: str, path: str) -> str:
+    normalized = _normalize(title)
+    if normalized in GENERIC_TITLES:
+        stem = Path(path).stem
+        return stem
+    return title.strip()[:220] or Path(path).stem
+
+
+def _section_from_path(path: str) -> str:
+    parts = Path(path).parts
+    if len(parts) >= 2:
+        return parts[-2]
+    return ""
+
+
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _tokens(text: str) -> list[str]:
+    return [
+        token
+        for token in _normalize(text).split()
+        if len(token) >= 3 and token not in STOPWORDS
+    ]
+
+
+if __name__ == "__main__":
+    main()
+
+import csv
+import sys
+from datetime import datetime
+from html import escape
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from database import BookRepository
+from find_files import find_online_sources, render_sources_html
+
+
+REPORTS_DIR = Path(__file__).resolve().parent / "reports"
+
+
+def generate_report() -> dict:
+    repo = BookRepository()
+    try:
+        books = repo.get_all()
+    finally:
+        repo.close()
+
+    REPORTS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = REPORTS_DIR / f"stomatology_online_sources_{timestamp}.csv"
+    html_path = REPORTS_DIR / f"stomatology_online_sources_{timestamp}.html"
+
+    rows = []
+    found = 0
+    strong = 0
+
+    for index, book in enumerate(books, start=1):
+        sources = find_online_sources(book)
+        best = sources[0] if sources else None
+        if best:
+            found += 1
+            if best.get("match_score", 0) >= 0.75:
+                strong += 1
+
+        rows.append(
+            {
+                "idx": index,
+                "genre": book.genre,
+                "title": book.title,
+                "author": book.author,
+                "year": book.year or "",
+                "publisher": book.publisher,
+                "best_source": best["source"] if best else "",
+                "best_access": best["access"] if best else "",
+                "best_score": f'{best["match_score"]:.3f}' if best else "",
+                "best_note": best.get("note", "") if best else "",
+                "best_url": best["url"] if best else "",
+                "all_sources": " | ".join(
+                    f'{item["source"]} [{item.get("access", "catalog")}] {item["url"]}'
+                    for item in sources[:5]
+                ),
+                "sources": sources,
+            }
+        )
+
+    _write_csv(csv_path, rows)
+    _write_html(html_path, rows, total=len(rows), found=found, strong=strong)
+
+    return {
+        "total": len(rows),
+        "found": found,
+        "strong": strong,
+        "csv_path": csv_path,
+        "html_path": html_path,
+    }
+
+
+def main():
+    result = generate_report()
+    print(f"Books processed: {result['total']}")
+    print(f"Books with at least one online lead: {result['found']}")
+    print(f"High-confidence matches (score >= 0.75): {result['strong']}")
+    print(f"CSV report: {result['csv_path']}")
+    print(f"HTML report: {result['html_path']}")
+
+
+def _write_csv(path: Path, rows: list[dict]):
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "№",
+                "Section",
+                "Title",
+                "Author",
+                "Year",
+                "Publisher",
+                "Best source",
+                "Access",
+                "Score",
+                "Note",
+                "URL",
+                "Alternative sources",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["idx"],
+                    row["genre"],
+                    row["title"],
+                    row["author"],
+                    row["year"],
+                    row["publisher"],
+                    row["best_source"],
+                    row["best_access"],
+                    row["best_score"],
+                    row["best_note"],
+                    row["best_url"],
+                    row["all_sources"],
+                ]
+            )
+
+
+def _write_html(path: Path, rows: list[dict], total: int, found: int, strong: int):
+    html_rows = []
+    for row in rows:
+        score = row["best_score"] or "-"
+        best_url = row["best_url"]
+        best_link = (
+            f'<a href="{escape(best_url, quote=True)}" target="_blank">open</a>'
+            if best_url
+            else "-"
+        )
+        html_rows.append(
+            "<tr>"
+            f"<td>{row['idx']}</td>"
+            f"<td>{escape(row['genre'])}</td>"
+            f"<td>{escape(row['title'])}</td>"
+            f"<td>{escape(row['author'])}</td>"
+            f"<td>{escape(str(row['year']))}</td>"
+            f"<td>{escape(row['best_source'])}</td>"
+            f"<td>{escape(row['best_access'])}</td>"
+            f"<td>{score}</td>"
+            f"<td>{escape(row['best_note'])}</td>"
+            f"<td>{best_link}</td>"
+            f"<td>{render_sources_html(row['sources'])}</td>"
+            "</tr>"
+        )
+
+    document = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stomatology online sources</title>
+  <style>
+    body {{
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      margin: 24px;
+      color: #1f2937;
+      background: #f8fafc;
+    }}
+    h1 {{
+      margin-bottom: 8px;
+    }}
+    .summary {{
+      margin-bottom: 18px;
+      padding: 14px 16px;
+      background: #e0f2fe;
+      border-radius: 10px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+    }}
+    th, td {{
+      border: 1px solid #dbe4ee;
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }}
+    th {{
+      position: sticky;
+      top: 0;
+      background: #dbeafe;
+    }}
+    tr:nth-child(even) {{
+      background: #f8fafc;
+    }}
+    .access {{
+      color: #475569;
+      font-size: 12px;
+    }}
+    a {{
+      color: #0f766e;
+      text-decoration: none;
+    }}
+    a:hover {{
+      text-decoration: underline;
+    }}
+  </style>
+</head>
+<body>
+  <h1>Stomatology literature: online sources</h1>
+  <div class="summary">
+    <div>Total books: {total}</div>
+    <div>Books with at least one online lead: {found}</div>
+    <div>High-confidence matches: {strong}</div>
+    <div>Generated: {escape(datetime.now().isoformat(timespec="seconds"))}</div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Section</th>
+        <th>Title</th>
+        <th>Author</th>
+        <th>Year</th>
+        <th>Best source</th>
+        <th>Access</th>
+        <th>Score</th>
+        <th>Note</th>
+        <th>Best link</th>
+        <th>Other legal sources</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(html_rows)}
+    </tbody>
+  </table>
+</body>
+</html>
+"""
+    path.write_text(document, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
+
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "books.db"
+
+WINDOW_TITLE = "Каталог книг — Stomatologie"
+WINDOW_MIN_WIDTH = 1050
+WINDOW_MIN_HEIGHT = 620
+
+GENRES = [
+    "Знайдена література",
+    "Orální chirurgie", "Konzervační zubní lékařství", "Parodontologie",
+    "Protetika", "Ortodoncie", "Dětské zubní lékařství",
+    "Stomatologie (загальне)", "Анатомія", "Фізіологія",
+    "Хірургія", "Терапія", "Педіатрія", "Інше"
+]
+
+LANGUAGES = ["Čeština", "Slovenčina", "English", "Українська", "Deutsch", "Інша"]
+
+TABLE_COLUMNS = [
+    ("title",     "Назва",       300),
+    ("author",    "Автор",       200),
+    ("genre",     "Розділ",      160),
+    ("year",      "Рік",          55),
+    ("publisher", "Видавництво", 150),
+    ("language",  "Мова",         75),
+]
+
+import sqlite3
+from pathlib import Path
+from models import Book
+from config import DB_PATH
+
+
+class BookRepository:
+    def __init__(self, db_path: Path = DB_PATH):
+        self._db_path = db_path
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._init_schema()
+
+    def _init_schema(self):
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS books (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT NOT NULL,
+                author      TEXT NOT NULL,
+                genre       TEXT DEFAULT '',
+                year        INTEGER,
+                publisher   TEXT DEFAULT '',
+                language    TEXT DEFAULT '',
+                isbn        TEXT DEFAULT '',
+                pages       INTEGER,
+                notes       TEXT DEFAULT '',
+                file_path   TEXT DEFAULT '',
+                processed   INTEGER DEFAULT 0,
+                date_added  TEXT DEFAULT ''
+            )
+        """)
+        # migrate: add file_path if it doesn't exist yet
+        cols = [r[1] for r in self._conn.execute("PRAGMA table_info(books)").fetchall()]
+        if "file_path" not in cols:
+            self._conn.execute("ALTER TABLE books ADD COLUMN file_path TEXT DEFAULT ''")
+        if "processed" not in cols:
+            self._conn.execute("ALTER TABLE books ADD COLUMN processed INTEGER DEFAULT 0")
+        self._conn.commit()
+
+    def _row_to_book(self, row: sqlite3.Row) -> Book:
+        return Book(
+            id=row["id"],
+            title=row["title"],
+            author=row["author"],
+            genre=row["genre"] or "",
+            year=row["year"],
+            publisher=row["publisher"] or "",
+            language=row["language"] or "",
+            isbn=row["isbn"] or "",
+            pages=row["pages"],
+            notes=row["notes"] or "",
+            file_path=row["file_path"] or "",
+            processed=bool(row["processed"]) if "processed" in row.keys() else False,
+            date_added=row["date_added"] or "",
+        )
+
+    def add_book(self, book: Book) -> int:
+        cur = self._conn.execute(
+            """INSERT INTO books (title, author, genre, year, publisher, language,
+                                  isbn, pages, notes, file_path, processed, date_added)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (book.title, book.author, book.genre, book.year, book.publisher,
+             book.language, book.isbn, book.pages, book.notes,
+             book.file_path, int(book.processed), book.date_added)
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def update_book(self, book: Book):
+        self._conn.execute(
+            """UPDATE books SET title=?, author=?, genre=?, year=?, publisher=?,
+                               language=?, isbn=?, pages=?, notes=?, processed=?
+               WHERE id=?""",
+            (book.title, book.author, book.genre, book.year, book.publisher,
+             book.language, book.isbn, book.pages, book.notes, int(book.processed), book.id)
+        )
+        self._conn.commit()
+
+    def set_file_path(self, book_id: int, file_path: str):
+        self._conn.execute(
+            "UPDATE books SET file_path=? WHERE id=?", (file_path, book_id)
+        )
+        self._conn.commit()
+
+    def set_processed(self, book_id: int, processed: bool):
+        self._conn.execute(
+            "UPDATE books SET processed=? WHERE id=?",
+            (1 if processed else 0, book_id),
+        )
+        self._conn.commit()
+
+    def delete_book(self, book_id: int):
+        self._conn.execute("DELETE FROM books WHERE id=?", (book_id,))
+        self._conn.commit()
+
+    def get_by_id(self, book_id: int) -> Book | None:
+        row = self._conn.execute(
+            "SELECT * FROM books WHERE id=?", (book_id,)
+        ).fetchone()
+        return self._row_to_book(row) if row else None
+
+    def get_all(self) -> list[Book]:
+        rows = self._conn.execute(
+            "SELECT * FROM books ORDER BY genre, author, title"
+        ).fetchall()
+        return [self._row_to_book(r) for r in rows]
+
+    def search(self, query: str, field: str = "all") -> list[Book]:
+        q = f"%{query}%"
+        if field == "all":
+            rows = self._conn.execute(
+                """SELECT * FROM books
+                   WHERE title LIKE ? OR author LIKE ? OR genre LIKE ?
+                      OR publisher LIKE ? OR notes LIKE ?
+                   ORDER BY genre, author, title""",
+                (q, q, q, q, q)
+            ).fetchall()
+        elif field == "year":
+            rows = self._conn.execute(
+                "SELECT * FROM books WHERE CAST(year AS TEXT) LIKE ? ORDER BY year",
+                (q,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT * FROM books WHERE {field} LIKE ? ORDER BY genre, author, title",
+                (q,)
+            ).fetchall()
+        return [self._row_to_book(r) for r in rows]
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+
+    def close(self):
+        self._conn.close()
+
+"""
+Online source finder for books from legitimate internet catalogs and open-access
+libraries.
+
+Two main entry points:
+  - find_file_for_book(book): best open file download when available
+  - find_online_sources(book): ranked list of legal online sources / previews
+"""
+import html
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from urllib.parse import quote_plus
+
+import requests
+from models import Book
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "BookCatalogBot/1.0 (educational use)"})
+TIMEOUT = 10
+MAX_CANDIDATES_PER_SOURCE = 3
+
+
+def find_online_sources(book: Book) -> list[dict]:
+    """
+    Returns ranked legal online sources for a book.
+
+    Each result may contain:
+      source, url, access, title, author, year, match_score, note
+    """
+    results = []
+    seen: set[tuple[str, str]] = set()
+
+    for finder in (
+        _search_czech_library_sources,
+        _search_mzk_sources,
+        _search_google_books,
+        _search_open_library_sources,
+        _search_internet_archive_sources,
+        _search_worldcat_sources,
+    ):
+        for candidate in finder(book):
+            key = (candidate["source"], candidate["url"])
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(candidate)
+
+    results.sort(
+        key=lambda item: (
+            _czech_library_boost(book, item),
+            _access_rank(item.get("access", "")),
+            item.get("match_score", 0),
+            _source_rank(item.get("source", ""), item.get("access", "")),
+            item.get("source", ""),
+        ),
+        reverse=True,
+    )
+    return results
+
+
+def find_file_for_book(book: Book) -> dict | None:
+    """
+    Try all sources. Returns dict with keys:
+      url, source, format ('pdf'|'epub'), size_mb (optional)
+    or None if nothing found.
+    """
+    result = (
+        _try_internet_archive(book)
+        or _try_open_library(book)
+        or _try_unpaywall(book)
+    )
+    return result
+
+
+# ── Internet Archive ──────────────────────────────────────────────────────────
+
+def _try_internet_archive(book: Book) -> dict | None:
+    query_parts = [f'title:("{book.title}")']
+    if book.author:
+        last = book.author.split(",")[0].split()[-1]
+        query_parts.append(f'creator:("{last}")')
+
+    params = {
+        "q": " AND ".join(query_parts),
+        "fl[]": ["identifier", "title", "format"],
+        "rows": 5,
+        "page": 1,
+        "output": "json",
+        "mediatype": "texts",
+    }
+    try:
+        r = SESSION.get("https://archive.org/advancedsearch.php", params=params, timeout=TIMEOUT)
+        docs = r.json().get("response", {}).get("docs", [])
+    except Exception:
+        return None
+
+    for doc in docs:
+        ident = doc.get("identifier", "")
+        if not ident:
+            continue
+        # Check available formats
+        try:
+            meta = SESSION.get(f"https://archive.org/metadata/{ident}/files", timeout=TIMEOUT).json()
+        except Exception:
+            continue
+
+        files = meta.get("result", [])
+        # Prefer PDF, then epub
+        for fmt in ("pdf", "epub"):
+            for f in files:
+                name = f.get("name", "")
+                if name.lower().endswith(f".{fmt}") and not name.startswith("__"):
+                    url = f"https://archive.org/download/{ident}/{name}"
+                    size = f.get("size")
+                    size_mb = round(int(size) / 1_048_576, 1) if size else None
+                    return {
+                        "url": url,
+                        "source": "Internet Archive",
+                        "format": fmt,
+                        "size_mb": size_mb,
+                        "identifier": ident,
+                    }
+    return None
+
+
+def _search_internet_archive_sources(book: Book) -> list[dict]:
+    query_parts = [f'title:("{book.title}")']
+    if book.author:
+        last = book.author.split(",")[0].split()[-1]
+        query_parts.append(f'creator:("{last}")')
+
+    params = {
+        "q": " AND ".join(query_parts),
+        "fl[]": ["identifier", "title", "creator", "year", "format"],
+        "rows": MAX_CANDIDATES_PER_SOURCE,
+        "page": 1,
+        "output": "json",
+        "mediatype": "texts",
+    }
+    try:
+        r = SESSION.get(
+            "https://archive.org/advancedsearch.php",
+            params=params,
+            timeout=TIMEOUT,
+        )
+        docs = r.json().get("response", {}).get("docs", [])
+    except Exception:
+        docs = []
+
+    results = []
+    for doc in docs:
+        ident = doc.get("identifier", "")
+        if not ident:
+            continue
+        title = doc.get("title", "") or book.title
+        author = _first_value(doc.get("creator")) or book.author
+        year = _safe_int(_first_value(doc.get("year")))
+        results.append(
+            _build_candidate(
+                book,
+                source="Internet Archive",
+                url=f"https://archive.org/details/{ident}",
+                access="catalog",
+                title=title,
+                author=author,
+                year=year,
+                note="Borrow/preview or open scan when available",
+            )
+        )
+
+    if not results:
+        results.append(
+            _build_search_candidate(
+                book,
+                source="Internet Archive",
+                url="https://archive.org/search?query=" + quote_plus(
+                    _search_terms(book)
+                ),
+            )
+        )
+    return results
+
+
+# ── Open Library ──────────────────────────────────────────────────────────────
+
+def _try_open_library(book: Book) -> dict | None:
+    try:
+        r = SESSION.get(
+            "https://openlibrary.org/search.json",
+            params={"title": book.title, "author": book.author, "limit": 5,
+                    "fields": "key,title,ia,lending_edition_s,public_scan_b"},
+            timeout=TIMEOUT,
+        )
+        docs = r.json().get("docs", [])
+    except Exception:
+        return None
+
+    for doc in docs:
+        # public domain scan available
+        if doc.get("public_scan_b") and doc.get("ia"):
+            ia_id = doc["ia"][0] if isinstance(doc["ia"], list) else doc["ia"]
+            return {
+                "url": f"https://archive.org/download/{ia_id}/{ia_id}.pdf",
+                "source": "Open Library (public domain)",
+                "format": "pdf",
+                "size_mb": None,
+                "identifier": ia_id,
+            }
+    return None
+
+
+def _search_open_library_sources(book: Book) -> list[dict]:
+    try:
+        r = SESSION.get(
+            "https://openlibrary.org/search.json",
+            params={
+                "title": book.title,
+                "author": book.author,
+                "limit": MAX_CANDIDATES_PER_SOURCE,
+                "fields": (
+                    "key,title,author_name,first_publish_year,"
+                    "ia,public_scan_b,ebook_access"
+                ),
+            },
+            timeout=TIMEOUT,
+        )
+        docs = r.json().get("docs", [])
+    except Exception:
+        docs = []
+
+    results = []
+    for doc in docs:
+        key = doc.get("key")
+        if not key:
+            continue
+        access = "catalog"
+        note = "Catalog page"
+        if doc.get("public_scan_b"):
+            access = "open"
+            note = "Public-domain scan available"
+        elif doc.get("ebook_access") not in ("no_ebook", None):
+            access = "borrow"
+            note = "Borrow/preview may be available"
+
+        results.append(
+            _build_candidate(
+                book,
+                source="Open Library",
+                url=f"https://openlibrary.org{key}",
+                access=access,
+                title=doc.get("title", "") or book.title,
+                author=", ".join(doc.get("author_name", [])[:3]) or book.author,
+                year=_safe_int(doc.get("first_publish_year")),
+                note=note,
+            )
+        )
+
+    if not results:
+        results.append(
+            _build_search_candidate(
+                book,
+                source="Open Library",
+                url="https://openlibrary.org/search?q=" + quote_plus(
+                    _search_terms(book)
+                ),
+            )
+        )
+    return results
+
+
+def _search_google_books(book: Book) -> list[dict]:
+    try:
+        r = SESSION.get(
+            "https://www.googleapis.com/books/v1/volumes",
+            params={
+                "q": f'intitle:"{book.title}" inauthor:"{book.author}"',
+                "maxResults": MAX_CANDIDATES_PER_SOURCE,
+                "printType": "books",
+            },
+            timeout=TIMEOUT,
+        )
+        items = r.json().get("items", [])
+    except Exception:
+        items = []
+
+    results = []
+    for item in items:
+        info = item.get("volumeInfo", {})
+        sale = item.get("saleInfo", {})
+        access_info = item.get("accessInfo", {})
+        preview_link = info.get("previewLink") or info.get("infoLink")
+        if not preview_link:
+            continue
+
+        access = "catalog"
+        note = "Book details"
+        if access_info.get("pdf", {}).get("isAvailable") or access_info.get("epub", {}).get("isAvailable"):
+            access = "open"
+            note = "Google Books shows downloadable content"
+        elif access_info.get("viewability") not in ("NO_PAGES", None):
+            access = "preview"
+            note = "Preview available"
+        elif sale.get("saleability") == "FOR_SALE":
+            access = "store"
+            note = "Purchase page"
+
+        results.append(
+            _build_candidate(
+                book,
+                source="Google Books",
+                url=preview_link,
+                access=access,
+                title=info.get("title", "") or book.title,
+                author=", ".join(info.get("authors", [])[:3]) or book.author,
+                year=_extract_year(info.get("publishedDate", "")),
+                note=note,
+            )
+        )
+
+    if not results:
+        results.append(
+            _build_search_candidate(
+                book,
+                source="Google Books",
+                url="https://books.google.com/books?q=" + quote_plus(
+                    _search_terms(book)
+                ),
+            )
+        )
+    return results
+
+
+def _search_czech_library_sources(book: Book) -> list[dict]:
+    query = _search_terms(book)
+    return [
+        _build_search_candidate(
+            book,
+            source="Knihovny.cz",
+            url="https://www.knihovny.cz/Search/Results?lookfor=" + quote_plus(query),
+            access="library",
+            note="Czech libraries portal",
+        )
+    ]
+
+
+def _search_mzk_sources(book: Book) -> list[dict]:
+    query = _search_terms(book)
+    return [
+        _build_search_candidate(
+            book,
+            source="MZK",
+            url="https://vufind.mzk.cz/Search/Results?lookfor=" + quote_plus(query),
+            access="library",
+            note="Moravian Library catalog",
+        )
+    ]
+
+
+def _search_worldcat_sources(book: Book) -> list[dict]:
+    return [
+        _build_search_candidate(
+            book,
+            source="WorldCat",
+            url="https://search.worldcat.org/search?q=" + quote_plus(
+                _search_terms(book, include_author=False)
+            ),
+            access="library",
+            note="Library holdings search",
+        )
+    ]
+
+
+# ── Unpaywall (DOI → open access PDF) ────────────────────────────────────────
+
+def _try_unpaywall(book: Book) -> dict | None:
+    # First find a DOI via CrossRef
+    doi = _crossref_doi(book)
+    if not doi:
+        return None
+    try:
+        r = SESSION.get(
+            f"https://api.unpaywall.org/v2/{doi}",
+            params={"email": "catalog@local"},
+            timeout=TIMEOUT,
+        )
+        data = r.json()
+    except Exception:
+        return None
+
+    if not data.get("is_oa"):
+        return None
+
+    best = data.get("best_oa_location") or {}
+    url = best.get("url_for_pdf") or best.get("url")
+    if url:
+        return {
+            "url": url,
+            "source": "Unpaywall (open access)",
+            "format": "pdf",
+            "size_mb": None,
+            "identifier": doi,
+        }
+    return None
+
+
+def _crossref_doi(book: Book) -> str | None:
+    try:
+        r = SESSION.get(
+            "https://api.crossref.org/works",
+            params={"query.title": book.title, "query.author": book.author, "rows": 1},
+            timeout=TIMEOUT,
+        )
+        items = r.json().get("message", {}).get("items", [])
+        if items:
+            return items[0].get("DOI")
+    except Exception:
+        pass
+    return None
+
+
+def render_sources_html(sources: list[dict]) -> str:
+    if not sources:
+        return ""
+    links = []
+    for item in sources[:4]:
+        label = html.escape(item["source"])
+        access = html.escape(item.get("access", "catalog"))
+        links.append(
+            f'<a href="{html.escape(item["url"], quote=True)}">{label}</a>'
+            f' <span class="access">{access}</span>'
+        )
+    return "<br>".join(links)
+
+
+def _build_candidate(
+    book: Book,
+    source: str,
+    url: str,
+    access: str,
+    title: str,
+    author: str,
+    year: int | None = None,
+    note: str = "",
+) -> dict:
+    return {
+        "source": source,
+        "url": url,
+        "access": access,
+        "title": title,
+        "author": author,
+        "year": year,
+        "match_score": _score_candidate(book, title, author, year),
+        "note": note,
+    }
+
+
+def _build_search_candidate(
+    book: Book,
+    source: str,
+    url: str,
+    access: str = "search",
+    note: str = "Search page",
+) -> dict:
+    return {
+        "source": source,
+        "url": url,
+        "access": access,
+        "title": book.title,
+        "author": book.author,
+        "year": book.year,
+        "match_score": 0.15,
+        "note": note,
+    }
+
+
+def _search_terms(book: Book, include_author: bool = True) -> str:
+    parts = [_clean_search_fragment(book.title)]
+    author = _clean_author_for_search(book.author) if include_author else ""
+    if author:
+        parts.append(author)
+    return " ".join(part for part in parts if part).strip()
+
+
+def _score_candidate(book: Book, title: str, author: str, year: int | None) -> float:
+    title_ratio = SequenceMatcher(
+        None,
+        _normalize_text(book.title),
+        _normalize_text(title),
+    ).ratio()
+    author_ratio = 0.0
+    if book.author and author:
+        author_ratio = SequenceMatcher(
+            None,
+            _normalize_text(book.author),
+            _normalize_text(author),
+        ).ratio()
+
+    score = title_ratio * 0.75 + author_ratio * 0.2
+    if book.year and year:
+        if book.year == year:
+            score += 0.05
+        elif abs(book.year - year) <= 1:
+            score += 0.02
+
+    return round(min(score, 0.99), 3)
+
+
+def _normalize_text(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _clean_search_fragment(value: str) -> str:
+    value = value or ""
+    value = value.replace("—", " ").replace("–", " ")
+    value = re.sub(r"\b[IVX]+\b(?:\s*[\.\-–]\s*\b[IVX]+\b)?", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\([^)]*\)", " ", value)
+    value = re.sub(r"[^0-9A-Za-zÀ-ž\s]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _clean_author_for_search(value: str) -> str:
+    value = value or ""
+    value = re.sub(r"\bet\s+al\.?\b", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\ba\s+kol\.?\b", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bkol\.?\b", " ", value, flags=re.IGNORECASE)
+    value = value.split(",")[0]
+    value = _clean_search_fragment(value)
+    return value
+
+
+def _extract_year(value: str) -> int | None:
+    match = re.search(r"\b(19|20)\d{2}\b", value or "")
+    return int(match.group(0)) if match else None
+
+
+def _safe_int(value) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_value(value):
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def _access_rank(access: str) -> int:
+    return {
+        "open": 6,
+        "borrow": 5,
+        "preview": 4,
+        "store": 3,
+        "library": 2,
+        "catalog": 1,
+        "search": 0,
+    }.get(access, 0)
+
+
+def _source_rank(source: str, access: str) -> int:
+    if access == "search":
+        return {
+            "Knihovny.cz": 5,
+            "MZK": 4,
+            "WorldCat": 4,
+            "Google Books": 3,
+            "Open Library": 2,
+            "Internet Archive": 1,
+        }.get(source, 0)
+    return {
+        "Knihovny.cz": 5,
+        "MZK": 4,
+        "Google Books": 4,
+        "Open Library": 3,
+        "Internet Archive": 2,
+        "WorldCat": 1,
+    }.get(source, 0)
+
+
+def _czech_library_boost(book: Book, item: dict) -> int:
+    if item.get("source") not in {"Knihovny.cz", "MZK", "WorldCat"}:
+        return 0
+    if _prefer_czech_libraries(book):
+        return {
+            "Knihovny.cz": 3,
+            "MZK": 2,
+            "WorldCat": 1,
+        }.get(item.get("source"), 0)
+    return 0
+
+
+def _prefer_czech_libraries(book: Book) -> bool:
+    language = (book.language or "").lower()
+    publisher = _normalize_text(book.publisher)
+    title = _normalize_text(book.title)
+    author = _normalize_text(book.author)
+
+    if language in {"cestina", "cesky", "slovencina", "slovensky"}:
+        return True
+
+    czech_markers = (
+        "praha", "olomouc", "brno", "karolinum", "galen", "grada",
+        "avicenum", "triton", "up olomouc", "univerzita palackeho",
+        "ceska", "czech",
+    )
+    haystack = " ".join(part for part in (publisher, title, author) if part)
+    return any(marker in haystack for marker in czech_markers)
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$TargetRoot,
+
+    [switch]$DryRun = $true,
+
+    [switch]$IncludeOneDrive,
+
+    [switch]$IncludeDentalWorkspace,
+
+    [switch]$IncludeExternalBooks
+)
+
+$ErrorActionPreference = "Stop"
+
+function Resolve-SafePath {
+    param([string]$PathValue)
+    return [System.IO.Path]::GetFullPath($PathValue)
+}
+
+function Ensure-Directory {
+    param([string]$PathValue)
+    if (-not (Test-Path -LiteralPath $PathValue)) {
+        New-Item -ItemType Directory -Path $PathValue | Out-Null
+    }
+}
+
+function Invoke-RobocopySafe {
+    param(
+        [string]$Source,
+        [string]$Target
+    )
+
+    Ensure-Directory -PathValue $Target
+
+    $arguments = @(
+        $Source,
+        $Target,
+        "/E",
+        "/R:1",
+        "/W:1",
+        "/Z",
+        "/FFT",
+        "/XA:SH",
+        "/XD", "node_modules", ".git", "__pycache__", ".venv", "venv", "env", ".cache",
+        "/XF", "Thumbs.db", "desktop.ini"
+    )
+
+    if ($DryRun) {
+        $arguments += "/L"
+    }
+
+    Write-Host ""
+    Write-Host "=== Sync ===" -ForegroundColor Cyan
+    Write-Host "Source: $Source"
+    Write-Host "Target: $Target"
+    if ($DryRun) {
+        Write-Host "Mode: DRY RUN" -ForegroundColor Yellow
+    }
+
+    & robocopy @arguments
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ge 8) {
+        throw "Robocopy failed for source: $Source (exit code $exitCode)"
+    }
+}
+
+$resolvedTargetRoot = Resolve-SafePath -PathValue $TargetRoot
+Ensure-Directory -PathValue $resolvedTargetRoot
+
+$home = [Environment]::GetFolderPath("UserProfile")
+$workspaceRoot = Resolve-SafePath -PathValue (Join-Path $home "OneDrive\Desktop\пошук літератури")
+$externalBooks = "D:\Новая папка\книги для gpt"
+
+$sources = @(
+    @{
+        Source = (Join-Path $home "Desktop")
+        RelativeTarget = "UserData\Desktop"
+    },
+    @{
+        Source = (Join-Path $home "Documents")
+        RelativeTarget = "UserData\Documents"
+    },
+    @{
+        Source = (Join-Path $home "Downloads")
+        RelativeTarget = "UserData\Downloads"
+    },
+    @{
+        Source = (Join-Path $home "Pictures")
+        RelativeTarget = "UserData\Pictures"
+    },
+    @{
+        Source = (Join-Path $home "Videos")
+        RelativeTarget = "UserData\Videos"
+    },
+    @{
+        Source = (Join-Path $home "Music")
+        RelativeTarget = "UserData\Music"
+    }
+)
+
+if ($IncludeOneDrive) {
+    $sources += @{
+        Source = (Join-Path $home "OneDrive")
+        RelativeTarget = "CloudBackups\OneDrive"
+    }
+}
+
+if ($IncludeDentalWorkspace) {
+    $sources += @{
+        Source = $workspaceRoot
+        RelativeTarget = "Projects\dental-search-workspace"
+    }
+}
+
+if ($IncludeExternalBooks) {
+    $sources += @{
+        Source = $externalBooks
+        RelativeTarget = "Libraries\external-books-gpt"
+    }
+}
+
+Write-Host "Target root: $resolvedTargetRoot" -ForegroundColor Green
+Write-Host "Dry run: $DryRun"
+Write-Host ""
+Write-Host "Included sources:" -ForegroundColor Green
+$sources | ForEach-Object {
+    Write-Host "- $($_.Source) -> $($_.RelativeTarget)"
+}
+
+foreach ($item in $sources) {
+    if (-not (Test-Path -LiteralPath $item.Source)) {
+        Write-Host "Skip missing source: $($item.Source)" -ForegroundColor DarkYellow
+        continue
+    }
+
+    $target = Join-Path $resolvedTargetRoot $item.RelativeTarget
+    Invoke-RobocopySafe -Source $item.Source -Target $target
+}
+
+Write-Host ""
+if ($DryRun) {
+    Write-Host "Dry run finished. Remove -DryRun:`$true or pass -DryRun:`$false for real copy." -ForegroundColor Yellow
+} else {
+    Write-Host "Migration finished." -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host "Do not migrate these folders into Google Drive mirror:" -ForegroundColor Magenta
+Write-Host "- C:\Windows"
+Write-Host "- C:\Program Files"
+Write-Host "- C:\Program Files (x86)"
+Write-Host "- C:\ProgramData"
+Write-Host "- C:\Users\vlad_\AppData"
+Write-Host "- Steam game libraries"
+
+"""
+One-time import script: loads recommended stomatology literature into books.db
+Run once:  python import_stomatologie.py
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from database import BookRepository
+from models import Book
+
+BOOKS = [
+    # ── Orální chirurgie ──────────────────────────────────────────────────────
+    Book(title="Stomatologická chirurgie", author="Toman J., Halmoš J.",
+         genre="Orální chirurgie", year=1984),
+    Book(title="Repetitorium stomatologické chirurgie I.–III.",
+         author="Pazderka J.", genre="Orální chirurgie",
+         publisher="UP Olomouc", year=1996),
+    Book(title="Traumatologie orofaciální oblasti",
+         author="Mazánek J.", genre="Orální chirurgie",
+         publisher="Grada Publishing", year=2006, language="Čeština"),
+    Book(title="Nádory orofaciální oblasti",
+         author="Mazánek J.", genre="Orální chirurgie",
+         publisher="Viktoria Publishing", year=1997, language="Čeština"),
+    Book(title="Dentální implantologie",
+         author="Šimůnek A.", genre="Orální chirurgie",
+         publisher="Nucleus", year=2001, language="Čeština"),
+
+    # ── Konzervační zubní lékařství ───────────────────────────────────────────
+    Book(title="Konzervační zubní lékařství",
+         author="Stejskalová J. a kol.", genre="Konzervační zubní lékařství",
+         publisher="Galén", year=2003, language="Čeština"),
+    Book(title="Základy klinické endodoncie",
+         author="Peřinka L.", genre="Konzervační zubní lékařství",
+         publisher="Quintessenz", year=2003, language="Čeština"),
+    Book(title="Záchovná stomatologie a parodontologie",
+         author="Hellwig E., Klimek J., Attin T.",
+         genre="Konzervační zubní lékařství",
+         publisher="Grada Avicenum", year=2000, language="Čeština"),
+    Book(title="Základy záchovné stomatologie",
+         author="Novák L. A a kol.", genre="Konzervační zubní lékařství",
+         publisher="Avicenum", year=1981, language="Čeština"),
+    Book(title="Prevence ve stomatologii",
+         author="Killman J. a kol.", genre="Konzervační zubní lékařství",
+         publisher="Galén", year=1999, language="Čeština"),
+    Book(title="Příručka stomatologa v praxi",
+         author="Kolektiv autorů", genre="Konzervační zubní lékařství",
+         publisher="Avicenum", year=1987, language="Čeština"),
+
+    # ── Parodontologie ────────────────────────────────────────────────────────
+    Book(title="Praktické parodontologie",
+         author="Slezák K.", genre="Parodontologie",
+         publisher="Quintessenz", year=1995, language="Čeština"),
+    Book(title="Infekční choroby ústní sliznice",
+         author="Slezák K., Dřízhal I. a kol.", genre="Parodontologie",
+         publisher="Grada Publishing", year=1997, language="Čeština"),
+    Book(title="Záchovná stomatologie a parodontologie",
+         author="Hellwig E., Klimek J., Attin T.", genre="Parodontologie",
+         publisher="Grada Avicenum", year=2000, language="Čeština"),
+    Book(title="Praktická parodontologie — klinické postupy",
+         author="Mutschelknauss R. E.", genre="Parodontologie",
+         publisher="Quintessenz", year=2002, language="Čeština"),
+    Book(title="Repetitorium onemocnění sliznice ústní",
+         author="Holá L., Fassmann A.", genre="Parodontologie", year=2003,
+         language="Čeština"),
+    Book(title="Atlas onemocnění ústní sliznice",
+         author="Slezák K., Dřízhal I.", genre="Parodontologie",
+         publisher="Quintessenz", year=2004, language="Čeština"),
+    Book(title="Stomatologické repetitorium (1. vydání)",
+         author="Mazánek J., Urban F. a kol.", genre="Parodontologie",
+         publisher="Grada", year=2003, language="Čeština"),
+    Book(title="Prevence ve stomatologii",
+         author="Killman J. a kol.", genre="Parodontologie",
+         publisher="Karolinum", year=1999, language="Čeština"),
+    Book(title="Lindhe's Clinical Periodontology and Implant Dentistry (2 vol.)",
+         author="Lindhe J. et al.", genre="Parodontologie",
+         publisher="John Wiley and Sons Ltd", year=2021, language="English"),
+    Book(title="Clinical Periodontology and Implantology (14th ed.)",
+         author="Newman M., Takei H., Carranza F., Klokvold P.",
+         genre="Parodontologie", year=2023, language="English"),
+    Book(title="Clinical Periodontology (9th Edition) [e-book]",
+         author="Newman M.G., Takei H.H., Carranza F.A.",
+         genre="Parodontologie", year=2003, language="English"),
+    Book(title="Clinical Periodontology and Implant Dentistry [e-book]",
+         author="Lindhe J., Lang N.P., Karring T.",
+         genre="Parodontologie", publisher="Blackwell Munksgaard",
+         year=2008, language="English"),
+    Book(title="Periodontal Disease and Overall Health: A Clinician's Guide [e-book]",
+         author="Genco R.J., Williams R.C.",
+         genre="Parodontologie",
+         publisher="Professional Audience Communications", year=2010,
+         language="English"),
+
+    # ── Protetika ─────────────────────────────────────────────────────────────
+    Book(title="Stomatologická protetika",
+         author="Andrik P.", genre="Protetika", language="Slovenčina"),
+    Book(title="Protetická technologie",
+         author="Bittner J.", genre="Protetika", year=2001, language="Čeština"),
+    Book(title="Stomatologická propedeutika",
+         author="Svoboda O.", genre="Protetika",
+         publisher="Avicenum", year=1984, language="Čeština"),
+    Book(title="Fixní zubní náhrady",
+         author="Krňoulová J., Hubálková H.", genre="Protetika",
+         publisher="Quintessenz", year=2002, language="Čeština"),
+    Book(title="Fixní a snímatelná protetika",
+         author="Dostálová T.", genre="Protetika",
+         publisher="Grada Publishing", year=2004, language="Čeština"),
+    Book(title="Částečné snímatelné náhrady",
+         author="Zicha A.", genre="Protetika",
+         publisher="Karolinum", year=1998, language="Čeština"),
+    Book(title="Protetická stomatologia — liečba a prevencia",
+         author="Tvrdoň M.", genre="Protetika",
+         publisher="Science", year=2001, language="Slovenčina"),
+    Book(title="Základy gnatologie",
+         author="Šedý J.", genre="Protetika",
+         publisher="Triton", year=2023, language="Čeština"),
+    Book(title="Klinická anatomie zubů a čelistí",
+         author="Šedý J., Foltán R.", genre="Protetika",
+         publisher="Triton", year=2009, language="Čeština"),
+    Book(title="Kompendium stomatologie I (2. rozš. vydání)",
+         author="Šedý J.", genre="Protetika",
+         publisher="Triton", year=2022, language="Čeština"),
+    Book(title="Kompendium stomatologie II",
+         author="Šedý J.", genre="Protetika",
+         publisher="Triton", language="Čeština"),
+
+    # ── Ortodoncie ────────────────────────────────────────────────────────────
+    Book(title="Ortodoncie I.–II.",
+         author="Kamínek M., Štefková M.", genre="Ortodoncie",
+         publisher="UP Olomouc", language="Čeština"),
+    Book(title="Ortodontický průvodce praktického zubního lékaře",
+         author="Koťová M.", genre="Ortodoncie",
+         publisher="Grada Avicenum", year=2006, language="Čeština"),
+    Book(title="Vybrané kapitoly z ortodoncie",
+         author="Šubrtová I.", genre="Ortodoncie",
+         publisher="Karolinum", year=1993, language="Čeština"),
+
+    # ── Dětské zubní lékařství ────────────────────────────────────────────────
+    Book(title="Prevence ve stomatologii (2. vydání)",
+         author="Killman J. a kol.", genre="Dětské zubní lékařství",
+         publisher="Galén-Karolinum", year=1999, language="Čeština"),
+    Book(title="Dětská stomatologie",
+         author="Komínek J., Rozkovcová E., Seman M.",
+         genre="Dětské zubní lékařství", year=1998, language="Čeština"),
+    Book(title="Orálna hygiena",
+         author="Kovalová E., Čierný M.", genre="Dětské zubní lékařství",
+         publisher="Prešov", year=1994, language="Slovenčina"),
+    Book(title="Vybrané kapitoly z pedostomatologie",
+         author="Fialová S., Nováková K.", genre="Dětské zubní lékařství",
+         publisher="Olomouc", year=2000, language="Čeština"),
+    Book(title="Pediatric Dentistry: A Clinical Approach",
+         author="Poulsen S., Koch G.", genre="Dětské zubní lékařství",
+         publisher="Copenhagen", year=2002, language="English"),
+    Book(title="Ortodoncie",
+         author="Kamínek M. et al.", genre="Dětské zubní lékařství",
+         publisher="Galén", year=2014, language="Čeština"),
+    Book(title="Atlas ortodontických anomálií",
+         author="Koťová M.", genre="Dětské zubní lékařství",
+         publisher="Česká stomatologická komora", year=2008, language="Čeština"),
+    Book(title="Dětské zubní lékařství (1. vydání)",
+         author="Koberová Ivančaková R., Merglová V.",
+         genre="Dětské zubní lékařství",
+         publisher="Advertis group", year=2014, language="Čeština"),
+    Book(title="Dětská stomatologie (4. vydání)",
+         author="Komínek J. a kol.", genre="Dětské zubní lékařství",
+         publisher="Avicenum", year=1988, language="Čeština"),
+    Book(title="Paediatric Dentistry",
+         author="Welbury R., Duggal M.S., Hosey M.T.",
+         genre="Dětské zubní lékařství",
+         publisher="Oxford University Press", year=2018, language="English"),
+]
+
+
+def main():
+    repo = BookRepository()
+    existing = {(b.title.lower(), b.author.lower()) for b in repo.get_all()}
+    added = 0
+    skipped = 0
+    for book in BOOKS:
+        key = (book.title.lower(), book.author.lower())
+        if key in existing:
+            skipped += 1
+        else:
+            repo.add_book(book)
+            existing.add(key)
+            added += 1
+    repo.close()
+    print(f"Done. Added: {added}, skipped (duplicates): {skipped}")
+    print(f"Total books in DB: {added + skipped} new / check books.db for full count")
+
+
+if __name__ == "__main__":
+    main()
